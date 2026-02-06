@@ -29,37 +29,67 @@ def init_unfold(vertices, faces, id_vertex):
     return init_points_ids, init_points_pos, plan
 
 
-def unfold(vertices, faces, init_points_ids, init_points_pos):
-    unwrap = igl.lscm(
-        v=vertices,
-        f=faces,
-        b=init_points_ids,
-        bc=init_points_pos,
-    )[1]
-    if not len(unwrap):
+def unfold(vertices, faces, init_points_ids, init_points_pos, method="LSCM"):
+    v = np.ascontiguousarray(vertices, dtype=np.float64)
+    f = np.ascontiguousarray(faces, dtype=np.int64)
+    b = np.ascontiguousarray(init_points_ids, dtype=np.int64)
+    bc = np.ascontiguousarray(init_points_pos, dtype=np.float64)
+
+    if method == "LSCM":
+        res = igl.lscm(v, f, b, bc)
+        if isinstance(res, tuple):
+            unwrap = res[0]
+        else:
+            unwrap = res
+    elif method == "ARAP":
+        # ARAP needs an initial guess. Use LSCM.
+        res_lscm = igl.lscm(v, f, b, bc)
+        unwrap_init = res_lscm[0] if isinstance(res_lscm, tuple) else res_lscm
+
+        # Precompute ARAP
+        # igl.arap_precomputation(V, F, dim, b)
+        # We use dim=2 for parameterization
+        arap_data = igl.ARAPData()
+        # ARAPEnergyType: 0: Spokes, 1: Spokes-and-rims, 2: Elements (default)
+        igl.arap_precomputation(v, f, 2, b, arap_data)
+
+        # Solve
+        unwrap = igl.arap_solve(bc, arap_data, unwrap_init)
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+    if unwrap is None or not len(unwrap):
         raise Exception("Impossible to unfold")
     return unwrap
 
 
 def get_all_bounds(faces):
-    boundary_facets = igl.boundary_facets(faces)
+    res = igl.boundary_facets(faces)
+    if isinstance(res, tuple):
+        boundary_facets = res[0]
+    else:
+        boundary_facets = res
+
     adjacency_list = {}
     for edge in boundary_facets:
-        if edge[0] not in adjacency_list:
-            adjacency_list[edge[0]] = []
-        if edge[1] not in adjacency_list:
-            adjacency_list[edge[1]] = []
-        adjacency_list[edge[0]].append(edge[1])
-        adjacency_list[edge[1]].append(edge[0])
+        u, v = int(edge[0]), int(edge[1])
+        if u not in adjacency_list:
+            adjacency_list[u] = []
+        if v not in adjacency_list:
+            adjacency_list[v] = []
+        adjacency_list[u].append(v)
+        adjacency_list[v].append(u)
     all_boundary_loops = []
     visited = set()
     for edge in boundary_facets:
-        if edge[0] not in visited:
-            loop, adjacency_list = find_boundary_loop(edge[0], adjacency_list)
+        u = int(edge[0])
+        if u not in visited:
+            loop, adjacency_list = find_boundary_loop(u, adjacency_list)
             all_boundary_loops.append(loop)
             visited.update(loop)
-        if edge[1] not in visited:
-            loop, adjacency_list = find_boundary_loop(edge[1], adjacency_list)
+        v = int(edge[1])
+        if v not in visited:
+            loop, adjacency_list = find_boundary_loop(v, adjacency_list)
             all_boundary_loops.append(loop)
             visited.update(loop)
     return all_boundary_loops

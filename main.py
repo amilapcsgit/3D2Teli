@@ -1,7 +1,8 @@
 import os
+import sys
 
-from flatten_surface import flatten_surface
-
-
+# To run the GUI by default
 if __name__ == "__main__":
-    flatten_surface(os.path.join(os.path.dirname(__file__), "..", "data", 'eighth_of_a_sphere.STL_'))
+    from gui import FlattenApp
+    app = FlattenApp()
+    app.mainloop()

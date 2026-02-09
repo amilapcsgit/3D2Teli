@@ -17,8 +17,8 @@ def compute_deformation(vertices, faces, unwrap):
     #                                     (np.linalg.norm(unfolded_edges[:, 0], axis=1) * np.linalg.norm(
     #                                         unfolded_edges[:, 1], axis=1)), -1.0, 1.0))
 
-    original_areas = np.linalg.norm(np.cross(original_edges[:, 0], original_edges[:, 1]), axis=1)
-    unfolded_areas = np.cross(unfolded_edges[:, 0], unfolded_edges[:, 1])
+    original_areas = 0.5 * np.linalg.norm(np.cross(original_edges[:, 0], original_edges[:, 1]), axis=1)
+    unfolded_areas = 0.5 * np.cross(unfolded_edges[:, 0], unfolded_edges[:, 1])
     area_2d = np.sum(unfolded_areas)
     area_3d = np.sum(original_areas)
 

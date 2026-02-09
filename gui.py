@@ -6,23 +6,25 @@ import customtkinter as ctk
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib import cm
+from matplotlib.colors import Normalize
 
 # Add current directory to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 try:
-    from flatten_surface.flatten_surface import flatten_mesh
-    from flatten_surface.import_export import load_with_components, mesh_to_data
+    from flatten_surface.flatten_surface import flatten_mesh, solve_flatten
+    from flatten_surface.import_export import load_with_components, mesh_to_data, component_quality, extract_source_label
 except ImportError:
-    from flatten_surface.flatten_surface import flatten_mesh
-    from flatten_surface.import_export import load_with_components, mesh_to_data
+    from flatten_surface.flatten_surface import flatten_mesh, solve_flatten
+    from flatten_surface.import_export import load_with_components, mesh_to_data, component_quality, extract_source_label
 
 
 class FlattenApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("3D Surface Flattening Tool - Tent Manufacturing")
+        self.title("Tent-Maker Pro - Surface Flattening for PVC Production")
         self.geometry("1450x900")
 
         ctk.set_appearance_mode("Dark")
@@ -32,9 +34,19 @@ class FlattenApp(ctk.CTk):
         self.output_path = ctk.StringVar()
         self.unit_var = ctk.StringVar(value="mm")
         self.method_var = ctk.StringVar(value="ARAP")
+        self.boundary_mode_var = ctk.StringVar(value="outer_only")
+        self.face_pick_mode = ctk.BooleanVar(value=False)
+        self.show_heatmap_var = ctk.BooleanVar(value=False)
+        self.allow_dirty_export_var = ctk.BooleanVar(value=False)
+        self.seam_allowance_var = ctk.StringVar(value="12.0")
+        self.align_to_x_enabled = False
+        self.source_label = ""
 
         self.components = []
         self.selected_component_idx = 0
+        self._pick_connection_id = None
+        self._heatmap_cache = {}
+        self._heatmap_colorbar = None
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=3)
@@ -43,7 +55,7 @@ class FlattenApp(ctk.CTk):
         self.left_panel = ctk.CTkFrame(self, width=360)
         self.left_panel.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
 
-        self.label = ctk.CTkLabel(self.left_panel, text="FLATTEN TOOL", font=("Roboto", 24, "bold"))
+        self.label = ctk.CTkLabel(self.left_panel, text="TENT-MAKER PRO", font=("Roboto", 24, "bold"))
         self.label.pack(pady=20)
 
         self.file_frame = ctk.CTkFrame(self.left_panel)
@@ -65,6 +77,16 @@ class FlattenApp(ctk.CTk):
         self.prev_btn.pack(side="left", padx=(0, 8))
         self.next_btn = ctk.CTkButton(self.comp_nav, text="Next", width=80, command=self.select_next_component)
         self.next_btn.pack(side="left")
+        self.face_pick_switch = ctk.CTkSwitch(
+            self.comp_nav,
+            text="Face Pick",
+            variable=self.face_pick_mode,
+            command=self.toggle_face_pick_mode,
+            onvalue=True,
+            offvalue=False,
+            width=110,
+        )
+        self.face_pick_switch.pack(side="right")
 
         self.opt_frame = ctk.CTkFrame(self.left_panel)
         self.opt_frame.pack(fill="x", padx=10, pady=5)
@@ -83,9 +105,44 @@ class FlattenApp(ctk.CTk):
         self.method_menu.set("ARAP (Advanced - Best for Tent)")
         self.method_var.set("ARAP")
 
+        ctk.CTkLabel(self.opt_frame, text="5. Boundary Export:").pack(anchor="w", padx=5)
+        self.boundary_menu = ctk.CTkOptionMenu(
+            self.opt_frame,
+            values=["Outer Only (Recommended)", "Outer + Large Holes", "All Loops"],
+            command=self.on_boundary_mode_change,
+        )
+        self.boundary_menu.pack(fill="x", padx=5, pady=5)
+        self.boundary_menu.set("Outer Only (Recommended)")
+        self.boundary_mode_var.set("outer_only")
+
+        ctk.CTkLabel(self.opt_frame, text="6. Seam Allowance (mm):").pack(anchor="w", padx=5)
+        self.seam_entry = ctk.CTkEntry(self.opt_frame, textvariable=self.seam_allowance_var)
+        self.seam_entry.pack(fill="x", padx=5, pady=5)
+
+        self.align_btn = ctk.CTkButton(self.opt_frame, text="Align to X-Axis: OFF", command=self.toggle_align_to_x)
+        self.align_btn.pack(fill="x", padx=5, pady=5)
+
+        self.heatmap_switch = ctk.CTkSwitch(
+            self.opt_frame,
+            text="Show Strain Heatmap",
+            variable=self.show_heatmap_var,
+            command=self.on_heatmap_toggle,
+            onvalue=True,
+            offvalue=False,
+        )
+        self.heatmap_switch.pack(anchor="w", padx=5, pady=(2, 6))
+        self.allow_dirty_switch = ctk.CTkSwitch(
+            self.opt_frame,
+            text="Allow Export with Mesh Warnings",
+            variable=self.allow_dirty_export_var,
+            onvalue=True,
+            offvalue=False,
+        )
+        self.allow_dirty_switch.pack(anchor="w", padx=5, pady=(0, 6))
+
         self.out_frame = ctk.CTkFrame(self.left_panel)
         self.out_frame.pack(fill="x", padx=10, pady=5)
-        ctk.CTkLabel(self.out_frame, text="5. Output:").pack(anchor="w", padx=5)
+        ctk.CTkLabel(self.out_frame, text="7. Output:").pack(anchor="w", padx=5)
         self.out_btn = ctk.CTkButton(self.out_frame, text="Set Export Path", command=self.browse_output)
         self.out_btn.pack(fill="x", padx=5, pady=5)
         self.out_label = ctk.CTkLabel(self.out_frame, textvariable=self.output_path, font=("Roboto", 10), wraplength=320)
@@ -125,13 +182,61 @@ class FlattenApp(ctk.CTk):
 
         self.viewer_help = ctk.CTkLabel(
             self.right_panel,
-            text="Viewer: Rotate=left drag, Pan/Zoom/Home via toolbar",
+            text="Viewer: Rotate=left drag. Use toolbar for Pan/Zoom/Home. Enable Face Pick to click-select sheet.",
             text_color="#bfc6d1",
         )
         self.viewer_help.pack(anchor="w", padx=8, pady=(2, 6))
+        self._pick_connection_id = self.canvas.mpl_connect("pick_event", self.on_pick)
 
     def on_method_change(self, val):
         self.method_var.set("ARAP" if "ARAP" in val else "LSCM")
+        self._heatmap_cache.clear()
+        if self.components:
+            self.preview_component(self.selected_component_idx)
+
+    def on_boundary_mode_change(self, val):
+        mapping = {
+            "Outer Only (Recommended)": "outer_only",
+            "Outer + Large Holes": "outer_and_large_holes",
+            "All Loops": "all_loops",
+        }
+        self.boundary_mode_var.set(mapping.get(val, "outer_only"))
+        self._heatmap_cache.clear()
+        if self.components:
+            self.preview_component(self.selected_component_idx)
+
+    def on_heatmap_toggle(self):
+        if self.components:
+            self.preview_component(self.selected_component_idx)
+
+    def toggle_align_to_x(self):
+        self.align_to_x_enabled = not self.align_to_x_enabled
+        state = "ON" if self.align_to_x_enabled else "OFF"
+        self.align_btn.configure(text=f"Align to X-Axis: {state}")
+
+    def _get_seam_allowance_mm(self):
+        raw = (self.seam_allowance_var.get() or "").strip()
+        if raw == "":
+            return 0.0
+        val = float(raw)
+        if val < 0:
+            raise ValueError("Seam allowance must be >= 0")
+        return val
+
+    def toggle_face_pick_mode(self):
+        if not self.components:
+            return
+        self.preview_component(self.selected_component_idx)
+        if self.face_pick_mode.get():
+            self.status_label.configure(
+                text="Face Pick enabled. Click a surface in the viewer to select it.",
+                text_color="#8ac926",
+            )
+        else:
+            self.status_label.configure(
+                text="Face Pick disabled. Use dropdown/Prev/Next to select surfaces.",
+                text_color="white",
+            )
 
     def browse_input(self):
         filename = filedialog.askopenfilename(filetypes=[("3D files", "*.stl *.obj *.3ds"), ("All files", "*.*")])
@@ -149,6 +254,8 @@ class FlattenApp(ctk.CTk):
             self.status_label.configure(text="Analyzing mesh and extracting selectable surfaces...", text_color="cyan")
             self.update()
             self.components = load_with_components(filename)
+            self.source_label = extract_source_label(filename).get("label", os.path.splitext(os.path.basename(filename))[0])
+            self._heatmap_cache.clear()
 
             if not self.components:
                 raise ValueError("No selectable surfaces found")
@@ -194,20 +301,113 @@ class FlattenApp(ctk.CTk):
     def _preview_mesh_data(self, mesh, max_faces=30000):
         vertices = np.asarray(mesh.vertices, dtype=np.float64)
         faces = np.asarray(mesh.faces, dtype=np.int64)
+        indices = np.arange(len(faces), dtype=np.int64)
         if len(faces) > max_faces:
             step = max(1, len(faces) // max_faces)
+            indices = indices[::step]
             faces = faces[::step]
-        return vertices, faces
+        return vertices, faces, indices
+
+    def _preview_mesh_data_all(self, mesh_count, mesh, max_total_faces=80000):
+        per_mesh = max(1200, max_total_faces // max(mesh_count, 1))
+        return self._preview_mesh_data(mesh, max_faces=per_mesh)
+
+    def _setup_axes(self):
+        self.ax.clear()
+        self.ax.set_facecolor("#2b2b2b")
+        self.ax.set_axis_off()
+
+    def _set_equal_limits(self, all_vertices):
+        vertices = np.asarray(all_vertices, dtype=np.float64)
+        max_range = np.array([
+            vertices[:, 0].max() - vertices[:, 0].min(),
+            vertices[:, 1].max() - vertices[:, 1].min(),
+            vertices[:, 2].max() - vertices[:, 2].min(),
+        ]).max() / 2.0
+        mid_x = (vertices[:, 0].max() + vertices[:, 0].min()) * 0.5
+        mid_y = (vertices[:, 1].max() + vertices[:, 1].min()) * 0.5
+        mid_z = (vertices[:, 2].max() + vertices[:, 2].min()) * 0.5
+        self.ax.set_xlim(mid_x - max_range, mid_x + max_range)
+        self.ax.set_ylim(mid_y - max_range, mid_y + max_range)
+        self.ax.set_zlim(mid_z - max_range, mid_z + max_range)
+
+    def _render_all_components_for_picking(self):
+        self._clear_heatmap_colorbar()
+        self._setup_axes()
+        mesh_count = len(self.components)
+        all_vertices = []
+
+        for idx, mesh in enumerate(self.components):
+            vertices, faces, _ = self._preview_mesh_data_all(mesh_count, mesh)
+            if len(faces) == 0:
+                continue
+            all_vertices.append(vertices)
+
+            base_color = cm.tab20(idx % 20)
+            alpha = 0.85 if idx == self.selected_component_idx else 0.40
+            edge_color = "#e8f0ff" if idx == self.selected_component_idx else "none"
+            line_width = 0.08 if idx == self.selected_component_idx else 0.0
+
+            collection = self.ax.plot_trisurf(
+                vertices[:, 0],
+                vertices[:, 1],
+                vertices[:, 2],
+                triangles=faces,
+                color=base_color,
+                edgecolor=edge_color,
+                linewidth=line_width,
+                alpha=alpha,
+                shade=True,
+            )
+            collection.set_picker(True)
+            setattr(collection, "_component_idx", idx)
+
+        if all_vertices:
+            merged = np.concatenate(all_vertices, axis=0)
+            self._set_equal_limits(merged)
+
+        active_mesh = self.components[self.selected_component_idx]
+        self.ax.set_title(
+            f"Face Pick Mode | Selected: Surface {self.selected_component_idx + 1} ({len(active_mesh.faces)} faces)",
+            color="white",
+        )
+        self.canvas.draw()
+
+    def _clear_heatmap_colorbar(self):
+        if self._heatmap_colorbar is not None:
+            self._heatmap_colorbar.remove()
+            self._heatmap_colorbar = None
+
+    def _get_component_strain(self, idx):
+        key = (idx, self.method_var.get(), self.boundary_mode_var.get())
+        if key in self._heatmap_cache:
+            return self._heatmap_cache[key]
+        vertices, faces = mesh_to_data(self.components[idx])
+        solved = solve_flatten(
+            vertices=vertices,
+            faces=faces,
+            input_unit=self.unit_var.get(),
+            method=self.method_var.get(),
+            boundary_mode=self.boundary_mode_var.get(),
+        )
+        strain = np.asarray(solved.get("strain_percent_per_face", []), dtype=np.float64)
+        self._heatmap_cache[key] = strain
+        return strain
 
     def preview_component(self, idx):
         if not self.components:
             return
 
-        mesh = self.components[idx]
-        vertices, faces = self._preview_mesh_data(mesh)
+        if self.face_pick_mode.get():
+            self._render_all_components_for_picking()
+            self._show_component_quality(self.components[idx])
+            return
 
-        self.ax.clear()
-        self.ax.plot_trisurf(
+        mesh = self.components[idx]
+        vertices, faces, face_indices = self._preview_mesh_data(mesh)
+
+        self._setup_axes()
+        collection = self.ax.plot_trisurf(
             vertices[:, 0],
             vertices[:, 1],
             vertices[:, 2],
@@ -217,22 +417,58 @@ class FlattenApp(ctk.CTk):
             linewidth=0.1,
             alpha=0.85,
         )
+        if self.show_heatmap_var.get() and self.method_var.get() == "ARAP":
+            strain = self._get_component_strain(idx)
+            if len(strain) > 0:
+                strain_preview = strain[face_indices]
+                collection.set_cmap("RdYlGn_r")
+                collection.set_array(strain_preview)
+                collection.set_norm(Normalize(vmin=0.0, vmax=3.0))
+                collection.set_edgecolor("none")
+                collection.set_linewidth(0.0)
+                self._clear_heatmap_colorbar()
+                self._heatmap_colorbar = self.fig.colorbar(collection, ax=self.ax, fraction=0.03, pad=0.02)
+                self._heatmap_colorbar.set_label("Strain % (Green=0, Red>3)")
+        else:
+            self._clear_heatmap_colorbar()
         self.ax.set_title(f"Surface Preview ({len(mesh.faces)} faces)", color="white")
 
-        max_range = np.array([
-            vertices[:, 0].max() - vertices[:, 0].min(),
-            vertices[:, 1].max() - vertices[:, 1].min(),
-            vertices[:, 2].max() - vertices[:, 2].min(),
-        ]).max() / 2.0
-        mid_x = (vertices[:, 0].max() + vertices[:, 0].min()) * 0.5
-        mid_y = (vertices[:, 1].max() + vertices[:, 1].min()) * 0.5
-        mid_z = (vertices[:, 2].max() + vertices[:, 2].min()) * 0.5
-
-        self.ax.set_xlim(mid_x - max_range, mid_x + max_range)
-        self.ax.set_ylim(mid_y - max_range, mid_y + max_range)
-        self.ax.set_zlim(mid_z - max_range, mid_z + max_range)
-        self.ax.set_axis_off()
+        self._set_equal_limits(vertices)
         self.canvas.draw()
+        self._show_component_quality(mesh)
+
+    def on_pick(self, event):
+        if not self.face_pick_mode.get() or not self.components:
+            return
+        if getattr(self.toolbar, "mode", ""):
+            return
+
+        component_idx = getattr(event.artist, "_component_idx", None)
+        if component_idx is None:
+            return
+        if component_idx < 0 or component_idx >= len(self.components):
+            return
+
+        self.selected_component_idx = component_idx
+        self._sync_component_ui()
+        self.status_label.configure(
+            text=f"Face Pick: selected Surface {component_idx + 1}.",
+            text_color="#8ac926",
+        )
+
+    def _show_component_quality(self, mesh):
+        q = component_quality(mesh)
+        if q["non_manifold_edges"] > 0 or q["degenerate_faces"] > 0:
+            color = "#f0ad4e"
+            flag = "Mesh warnings"
+        else:
+            color = "#8ac926"
+            flag = "Mesh clean"
+        details = (
+            f"{flag}: faces={q['faces']}, open_edges={q['open_edges']}, "
+            f"non_manifold={q['non_manifold_edges']}, degenerate={q['degenerate_faces']}"
+        )
+        self.status_label.configure(text=details, text_color=color)
 
     def browse_output(self):
         filename = filedialog.asksaveasfilename(
@@ -250,6 +486,8 @@ class FlattenApp(ctk.CTk):
         out = self.output_path.get().strip()
         unit = self.unit_var.get()
         method = self.method_var.get()
+        boundary_mode = self.boundary_mode_var.get()
+        seam_allowance_mm = self._get_seam_allowance_mm()
 
         if not out:
             self.status_label.configure(text="Error: Set output path first", text_color="red")
@@ -260,6 +498,18 @@ class FlattenApp(ctk.CTk):
             self.status_label.configure(text=f"Flattening Surface {surface_no} with {method}...", text_color="cyan")
             self.update()
 
+            q = component_quality(self.components[self.selected_component_idx])
+            has_hard_mesh_issue = q["non_manifold_edges"] > 0 or q["degenerate_faces"] > 0
+            if has_hard_mesh_issue and not self.allow_dirty_export_var.get():
+                self.status_label.configure(
+                    text=(
+                        "Export blocked: mesh has non-manifold or degenerate faces.\n"
+                        "Enable 'Allow Export with Mesh Warnings' to override."
+                    ),
+                    text_color="red",
+                )
+                return
+
             vertices, faces = mesh_to_data(self.components[self.selected_component_idx])
             result = flatten_mesh(
                 vertices=vertices,
@@ -268,16 +518,26 @@ class FlattenApp(ctk.CTk):
                 show_plot=False,
                 input_unit=unit,
                 method=method,
+                boundary_mode=boundary_mode,
+                seam_allowance_mm=seam_allowance_mm,
+                align_to_x=self.align_to_x_enabled,
+                label_text=self.source_label,
             )
 
             metrics = result.get("metrics", {})
             area_err = metrics.get("area_error_pct", 0.0)
             perim_err = metrics.get("perimeter_error_pct", 0.0)
+            loops = result.get("bounds_exported", 0)
 
             quality_color = "green" if area_err <= 2.0 and perim_err <= 1.0 else "#f0ad4e"
+            warning_note = ""
+            if area_err > 3.0 or perim_err > 3.0:
+                warning_note = "\nProduction warning: high distortion. Consider different sheet/relief cuts."
             status = (
                 f"Success: {os.path.basename(out)}\n"
-                f"Area error: {area_err:.2f}% | Perimeter error: {perim_err:.2f}%"
+                f"Area error: {area_err:.2f}% | Perimeter error: {perim_err:.2f}% | Loops: {loops}\n"
+                f"Seam allowance: {seam_allowance_mm:.2f} mm | Align X: {'ON' if self.align_to_x_enabled else 'OFF'}"
+                f"{warning_note}"
             )
             self.status_label.configure(text=status, text_color=quality_color)
         except Exception as e:

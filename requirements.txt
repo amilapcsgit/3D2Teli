@@ -7,3 +7,4 @@ ezdxf>=1.4.3
 svgwrite>=1.4.3
 libigl>=2.6.1
 networkx>=3.6
+shapely>=2.0

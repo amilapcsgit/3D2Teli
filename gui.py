@@ -38,6 +38,8 @@ class FlattenApp(ctk.CTk):
         self.face_pick_mode = ctk.BooleanVar(value=False)
         self.show_heatmap_var = ctk.BooleanVar(value=False)
         self.allow_dirty_export_var = ctk.BooleanVar(value=False)
+        self.auto_relief_var = ctk.BooleanVar(value=True)
+        self.relief_threshold_var = ctk.StringVar(value="3.0")
         self.seam_allowance_var = ctk.StringVar(value="12.0")
         self.align_to_x_enabled = False
         self.source_label = ""
@@ -139,6 +141,17 @@ class FlattenApp(ctk.CTk):
             offvalue=False,
         )
         self.allow_dirty_switch.pack(anchor="w", padx=5, pady=(0, 6))
+        self.auto_relief_switch = ctk.CTkSwitch(
+            self.opt_frame,
+            text="Auto Relief-Cut Suggestion",
+            variable=self.auto_relief_var,
+            onvalue=True,
+            offvalue=False,
+        )
+        self.auto_relief_switch.pack(anchor="w", padx=5, pady=(0, 4))
+        ctk.CTkLabel(self.opt_frame, text="Relief Trigger Strain %:").pack(anchor="w", padx=5)
+        self.relief_threshold_entry = ctk.CTkEntry(self.opt_frame, textvariable=self.relief_threshold_var)
+        self.relief_threshold_entry.pack(fill="x", padx=5, pady=(0, 6))
 
         self.out_frame = ctk.CTkFrame(self.left_panel)
         self.out_frame.pack(fill="x", padx=10, pady=5)
@@ -223,6 +236,51 @@ class FlattenApp(ctk.CTk):
             raise ValueError("Seam allowance must be >= 0")
         return val
 
+    def _get_relief_threshold_pct(self):
+        raw = (self.relief_threshold_var.get() or "").strip()
+        if raw == "":
+            return 3.0
+        val = float(raw)
+        if val <= 0:
+            raise ValueError("Relief trigger strain must be > 0")
+        return val
+
+    def _ask_input_unit(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Input Units")
+        dialog.geometry("360x170")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        result = {"unit": None}
+        unit_var = ctk.StringVar(value=self.unit_var.get() or "mm")
+
+        ctk.CTkLabel(
+            dialog,
+            text="Select units used by the loaded model file:",
+            wraplength=330,
+            justify="left",
+        ).pack(padx=12, pady=(12, 8), anchor="w")
+
+        unit_menu = ctk.CTkOptionMenu(dialog, values=["mm", "cm", "m", "inch"], variable=unit_var)
+        unit_menu.pack(fill="x", padx=12, pady=4)
+
+        row = ctk.CTkFrame(dialog, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=(12, 10))
+
+        def on_ok():
+            result["unit"] = unit_var.get()
+            dialog.destroy()
+
+        def on_cancel():
+            dialog.destroy()
+
+        ctk.CTkButton(row, text="Cancel", command=on_cancel, width=90).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(row, text="Use Unit", command=on_ok, width=90).pack(side="right")
+
+        self.wait_window(dialog)
+        return result["unit"]
+
     def toggle_face_pick_mode(self):
         if not self.components:
             return
@@ -241,6 +299,10 @@ class FlattenApp(ctk.CTk):
     def browse_input(self):
         filename = filedialog.askopenfilename(filetypes=[("3D files", "*.stl *.obj *.3ds"), ("All files", "*.*")])
         if filename:
+            picked_unit = self._ask_input_unit()
+            if not picked_unit:
+                return
+            self.unit_var.set(picked_unit)
             self.input_path.set(filename)
             base = os.path.splitext(filename)[0]
             self.output_path.set(base + ".dxf")
@@ -488,6 +550,7 @@ class FlattenApp(ctk.CTk):
         method = self.method_var.get()
         boundary_mode = self.boundary_mode_var.get()
         seam_allowance_mm = self._get_seam_allowance_mm()
+        relief_threshold_pct = self._get_relief_threshold_pct()
 
         if not out:
             self.status_label.configure(text="Error: Set output path first", text_color="red")
@@ -522,12 +585,16 @@ class FlattenApp(ctk.CTk):
                 seam_allowance_mm=seam_allowance_mm,
                 align_to_x=self.align_to_x_enabled,
                 label_text=self.source_label,
+                auto_relief_cut=self.auto_relief_var.get(),
+                relief_threshold_pct=relief_threshold_pct,
             )
 
             metrics = result.get("metrics", {})
             area_err = metrics.get("area_error_pct", 0.0)
             perim_err = metrics.get("perimeter_error_pct", 0.0)
             loops = result.get("bounds_exported", 0)
+            relief_path = result.get("relief_path_2d")
+            relief_note = "Yes" if relief_path is not None else "No"
 
             quality_color = "green" if area_err <= 2.0 and perim_err <= 1.0 else "#f0ad4e"
             warning_note = ""
@@ -536,7 +603,8 @@ class FlattenApp(ctk.CTk):
             status = (
                 f"Success: {os.path.basename(out)}\n"
                 f"Area error: {area_err:.2f}% | Perimeter error: {perim_err:.2f}% | Loops: {loops}\n"
-                f"Seam allowance: {seam_allowance_mm:.2f} mm | Align X: {'ON' if self.align_to_x_enabled else 'OFF'}"
+                f"Seam allowance: {seam_allowance_mm:.2f} mm | Align X: {'ON' if self.align_to_x_enabled else 'OFF'}\n"
+                f"Relief cut suggested: {relief_note} (trigger>{relief_threshold_pct:.2f}%)"
                 f"{warning_note}"
             )
             self.status_label.configure(text=status, text_color=quality_color)

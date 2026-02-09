@@ -1,6 +1,7 @@
 import os
 import tkinter as tk
 from tkinter import filedialog
+import heapq
 
 import numpy as np
 
@@ -102,6 +103,86 @@ def _select_bounds_for_export(bounds, unwrap, mode="outer_only", hole_area_ratio
     return selected
 
 
+def _build_vertex_adjacency(vertices, faces):
+    n = len(vertices)
+    adjacency = [[] for _ in range(n)]
+    edges = np.vstack((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]))
+    for u, v in edges:
+        u = int(u)
+        v = int(v)
+        if u == v:
+            continue
+        w = float(np.linalg.norm(vertices[u] - vertices[v]))
+        adjacency[u].append((v, w))
+        adjacency[v].append((u, w))
+    return adjacency
+
+
+def _shortest_path(adjacency, start, goals):
+    goals = set(int(g) for g in goals)
+    dist = {int(start): 0.0}
+    prev = {}
+    pq = [(0.0, int(start))]
+    visited = set()
+    goal_hit = None
+    while pq:
+        d, u = heapq.heappop(pq)
+        if u in visited:
+            continue
+        visited.add(u)
+        if u in goals:
+            goal_hit = u
+            break
+        for v, w in adjacency[u]:
+            nd = d + w
+            if nd < dist.get(v, float("inf")):
+                dist[v] = nd
+                prev[v] = u
+                heapq.heappush(pq, (nd, v))
+    if goal_hit is None:
+        return None
+    path = [goal_hit]
+    while path[-1] != int(start):
+        path.append(prev[path[-1]])
+    path.reverse()
+    return path
+
+
+def _suggest_relief_cut(vertices, faces, bounds, strain_percent, threshold_pct=3.0):
+    if len(bounds) == 0:
+        return None
+    boundary_vertices = np.unique(np.concatenate([np.asarray(b, dtype=np.int64) for b in bounds]))
+    if len(boundary_vertices) == 0:
+        return None
+
+    high_faces = np.where(np.asarray(strain_percent, dtype=np.float64) >= threshold_pct)[0]
+    if len(high_faces) == 0:
+        return None
+    boundary_set = set(int(v) for v in boundary_vertices.tolist())
+    high_face_order = high_faces[np.argsort(np.asarray(strain_percent)[high_faces])[::-1]]
+    seed_vertex = None
+    for face_id in high_face_order:
+        tri = [int(v) for v in faces[int(face_id)]]
+        interior = [v for v in tri if v not in boundary_set]
+        if interior:
+            seed_vertex = interior[0]
+            break
+    if seed_vertex is None:
+        # Fallback to farthest high-strain face centroid vertex from boundary.
+        seed_face = int(high_face_order[0])
+        tri = [int(v) for v in faces[seed_face]]
+        seed_vertex = tri[0]
+    if seed_vertex in boundary_set:
+        # No interior route available.
+        return None
+
+    adjacency = _build_vertex_adjacency(vertices, faces)
+    path = _shortest_path(adjacency, seed_vertex, boundary_vertices)
+    if path is None or len(path) < 2:
+        return None
+    return np.asarray(path, dtype=np.int64)
+
+
 def flatten_mesh(
     vertices,
     faces,
@@ -115,6 +196,8 @@ def flatten_mesh(
     seam_allowance_mm=0.0,
     align_to_x=False,
     label_text=None,
+    auto_relief_cut=False,
+    relief_threshold_pct=3.0,
 ):
     bounds = get_all_bounds(faces)
     if not bounds:
@@ -128,6 +211,18 @@ def flatten_mesh(
     unwrap = unfold(vertices, faces, init_points_ids, init_points_pos, method=method)
     export_bounds = _select_bounds_for_export(bounds, unwrap, mode=boundary_mode)
     strain_percent = compute_deformation(vertices, faces, unwrap, verbose=True)
+    relief_path_vertex_ids = None
+    relief_path_2d = None
+    if auto_relief_cut:
+        relief_path_vertex_ids = _suggest_relief_cut(
+            vertices=vertices,
+            faces=faces,
+            bounds=export_bounds,
+            strain_percent=strain_percent,
+            threshold_pct=relief_threshold_pct,
+        )
+        if relief_path_vertex_ids is not None:
+            relief_path_2d = unwrap[relief_path_vertex_ids]
 
     if show_plot:
         plot(vertices, faces, unwrap, init_points_pos, plan, init_points_ids, export_bounds, strain_percent, path_png)
@@ -142,6 +237,7 @@ def flatten_mesh(
             seam_allowance_mm=seam_allowance_mm,
             align_to_x=align_to_x,
             label_text=label_text,
+            relief_cut_path=relief_path_2d,
         )
     else:
         export_svg(unwrap, export_bounds, path_output, scale=scale)
@@ -157,6 +253,8 @@ def flatten_mesh(
         "strain_percent_per_face": strain_percent,
         "unwrap": unwrap,
         "export_bounds": export_bounds,
+        "relief_path_vertex_ids": relief_path_vertex_ids,
+        "relief_path_2d": relief_path_2d,
     }
 
 
@@ -166,6 +264,7 @@ def solve_flatten(
     input_unit="mm",
     method="LSCM",
     boundary_mode="outer_only",
+    relief_threshold_pct=3.0,
 ):
     bounds = get_all_bounds(faces)
     if not bounds:
@@ -179,6 +278,14 @@ def solve_flatten(
     unwrap = unfold(vertices, faces, init_points_ids, init_points_pos, method=method)
     export_bounds = _select_bounds_for_export(bounds, unwrap, mode=boundary_mode)
     strain_percent = compute_deformation(vertices, faces, unwrap, verbose=False)
+    relief_path_vertex_ids = _suggest_relief_cut(
+        vertices=vertices,
+        faces=faces,
+        bounds=export_bounds,
+        strain_percent=strain_percent,
+        threshold_pct=relief_threshold_pct,
+    )
+    relief_path_2d = unwrap[relief_path_vertex_ids] if relief_path_vertex_ids is not None else None
     scale = get_unit_scale(input_unit)
     metrics = _compute_metrics(vertices, faces, unwrap, export_bounds, scale)
     return {
@@ -190,6 +297,8 @@ def solve_flatten(
         "strain_percent_per_face": strain_percent,
         "unwrap": unwrap,
         "export_bounds": export_bounds,
+        "relief_path_vertex_ids": relief_path_vertex_ids,
+        "relief_path_2d": relief_path_2d,
     }
 
 
@@ -205,6 +314,8 @@ def main(
     seam_allowance_mm=0.0,
     align_to_x=False,
     label_text=None,
+    auto_relief_cut=False,
+    relief_threshold_pct=3.0,
 ):
     if path_input is None or not os.path.isfile(path_input):
         root = tk.Tk()
@@ -239,4 +350,6 @@ def main(
         seam_allowance_mm=seam_allowance_mm,
         align_to_x=align_to_x,
         label_text=label_text,
+        auto_relief_cut=auto_relief_cut,
+        relief_threshold_pct=relief_threshold_pct,
     )

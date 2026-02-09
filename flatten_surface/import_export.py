@@ -223,13 +223,13 @@ def _rotate_xy(points, angle_rad, center):
     return (points - center) @ rot.T + center
 
 
-def _align_loops_to_x(loops):
+def _get_alignment_transform(loops):
     if not loops:
-        return loops
+        return None, None
     try:
         from shapely.geometry import Polygon
     except Exception:
-        return loops
+        return None, None
 
     areas = [abs(_loop_area(loop)) for loop in loops]
     outer = loops[int(np.argmax(areas))]
@@ -237,19 +237,25 @@ def _align_loops_to_x(loops):
     if not poly.is_valid:
         poly = poly.buffer(0)
     if poly.is_empty:
-        return loops
+        return None, None
 
     mrr = poly.minimum_rotated_rectangle
     coords = np.asarray(mrr.exterior.coords[:-1], dtype=np.float64)
     if len(coords) < 2:
-        return loops
+        return None, None
     edges = np.roll(coords, -1, axis=0) - coords
     lengths = np.linalg.norm(edges, axis=1)
     idx = int(np.argmax(lengths))
     edge = edges[idx]
     angle = np.arctan2(edge[1], edge[0])
     center = np.asarray(poly.centroid.coords[0], dtype=np.float64)
-    return [_rotate_xy(loop, -angle, center) for loop in loops]
+    return -angle, center
+
+
+def _apply_alignment(loops, angle, center):
+    if angle is None or center is None:
+        return loops
+    return [_rotate_xy(loop, angle, center) for loop in loops]
 
 
 def _offset_outer_loop(loops, seam_allowance_mm):
@@ -288,6 +294,7 @@ def export_dxf(
     seam_allowance_mm=0.0,
     align_to_x=False,
     label_text=None,
+    relief_cut_path=None,
 ):
     doc = ezdxf.new("R2000")
     doc.units = units.MM
@@ -296,8 +303,15 @@ def export_dxf(
 
     contours = [unwrap[bound] * scale for bound in bounds]
     contours = [np.asarray(c, dtype=np.float64) for c in contours if len(c) >= 3]
+    relief_path = None
+    if relief_cut_path is not None and len(relief_cut_path) >= 2:
+        relief_path = np.asarray(relief_cut_path, dtype=np.float64) * scale
+
     if align_to_x:
-        contours = _align_loops_to_x(contours)
+        angle, center = _get_alignment_transform(contours)
+        contours = _apply_alignment(contours, angle, center)
+        if relief_path is not None:
+            relief_path = _rotate_xy(relief_path, angle, center)
 
     if "FOLD_LINE" not in doc.layers:
         doc.layers.add("FOLD_LINE", dxfattribs={"color": 5})
@@ -305,6 +319,8 @@ def export_dxf(
         doc.layers.add("CUT_LINE", dxfattribs={"color": 1})
     if "LABELS" not in doc.layers:
         doc.layers.add("LABELS", dxfattribs={"color": 3})
+    if "RELIEF_CUT" not in doc.layers:
+        doc.layers.add("RELIEF_CUT", dxfattribs={"color": 2})
 
     for contour in contours:
         points = [(float(p[0]), float(p[1])) for p in contour]
@@ -326,5 +342,9 @@ def export_dxf(
             dxfattribs={"layer": "LABELS", "char_height": max(5.0, 0.015 * np.ptp(contours[0][:, 0]))},
         )
         mtext.set_location((float(center[0]), float(center[1])), attachment_point=5)
+
+    if relief_path is not None:
+        relief_points = [(float(p[0]), float(p[1])) for p in relief_path]
+        msp.add_lwpolyline(relief_points, dxfattribs={"layer": "RELIEF_CUT"}, close=False)
 
     doc.saveas(path_dxf)

@@ -24,9 +24,9 @@ def compute_deformation(vertices, faces, unwrap):
 
     area_diff = area_3d - area_2d
 
-    print(f"3D Area: {area_3d} mm²")
-    print(f"2D Area: {area_2d} mm²")
-    print(f"Diff Area: {area_diff} mm²")
+    print(f"3D Area: {area_3d} mm^2")
+    print(f"2D Area: {area_2d} mm^2")
+    print(f"Diff Area: {area_diff} mm^2")
 
     area_diff = original_areas - unfolded_areas
     # angle_diff = unfolded_angles - original_angles

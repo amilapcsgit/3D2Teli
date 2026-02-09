@@ -8,9 +8,39 @@ def plane_through_3_points(x1, y1, z1, x2, y2, z2, x3, y3, z3):
 
 
 def rotation_matrix_from_vectors(vec1, vec2):
-    axis = np.cross(vec1, vec2)
+    v1 = np.asarray(vec1, dtype=np.float64)
+    v2 = np.asarray(vec2, dtype=np.float64)
+    v1_norm = np.linalg.norm(v1)
+    v2_norm = np.linalg.norm(v2)
+    if v1_norm == 0 or v2_norm == 0:
+        raise ValueError("Cannot build rotation matrix from zero-length vector")
+
+    v1 = v1 / v1_norm
+    v2 = v2 / v2_norm
+
+    dot = float(np.clip(np.dot(v1, v2), -1.0, 1.0))
+
+    # Parallel vectors: no rotation.
+    if np.isclose(dot, 1.0):
+        return np.eye(3)
+
+    # Anti-parallel vectors: rotate 180 degrees around any orthogonal axis.
+    if np.isclose(dot, -1.0):
+        helper = np.array([1.0, 0.0, 0.0])
+        if np.isclose(abs(v1[0]), 1.0):
+            helper = np.array([0.0, 1.0, 0.0])
+        axis = np.cross(v1, helper)
+        axis = axis / np.linalg.norm(axis)
+        ux, uy, uz = axis
+        return np.array([
+            [2.0 * ux * ux - 1.0, 2.0 * ux * uy, 2.0 * ux * uz],
+            [2.0 * uy * ux, 2.0 * uy * uy - 1.0, 2.0 * uy * uz],
+            [2.0 * uz * ux, 2.0 * uz * uy, 2.0 * uz * uz - 1.0],
+        ])
+
+    axis = np.cross(v1, v2)
     axis = axis / np.linalg.norm(axis)
-    angle = np.arccos(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2)))
+    angle = np.arccos(dot)
     cos_angle = np.cos(angle)
     sin_angle = np.sin(angle)
     one_minus_cos = 1.0 - cos_angle
@@ -36,8 +66,13 @@ def find_boundary_loop(start_vertex, adjacency_list):
     previous_vertex = None
     while True:
         boundary_loop.append(current_vertex)
-        neighbors = adjacency_list[current_vertex]
-        next_vertex = neighbors[0] if neighbors[0] != previous_vertex else neighbors[1]
+        neighbors = adjacency_list.get(current_vertex, [])
+        if not neighbors:
+            break
+        if len(neighbors) == 1:
+            next_vertex = neighbors[0]
+        else:
+            next_vertex = neighbors[0] if neighbors[0] != previous_vertex else neighbors[1]
         if next_vertex == start_vertex:
             break
         previous_vertex = current_vertex

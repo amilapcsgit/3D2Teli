@@ -56,18 +56,26 @@ class FlattenApp(ctk.CTk):
 
         self.left_panel = ctk.CTkFrame(self, width=360)
         self.left_panel.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
+        self.left_panel.grid_rowconfigure(0, weight=1)
+        self.left_panel.grid_rowconfigure(1, weight=0)
+        self.left_panel.grid_columnconfigure(0, weight=1)
 
-        self.label = ctk.CTkLabel(self.left_panel, text="TENT-MAKER PRO", font=("Roboto", 24, "bold"))
+        self.controls_frame = ctk.CTkScrollableFrame(self.left_panel)
+        self.controls_frame.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
+        self.actions_frame = ctk.CTkFrame(self.left_panel)
+        self.actions_frame.grid(row=1, column=0, sticky="ew", padx=0, pady=(8, 0))
+
+        self.label = ctk.CTkLabel(self.controls_frame, text="TENT-MAKER PRO", font=("Roboto", 24, "bold"))
         self.label.pack(pady=20)
 
-        self.file_frame = ctk.CTkFrame(self.left_panel)
+        self.file_frame = ctk.CTkFrame(self.controls_frame)
         self.file_frame.pack(fill="x", padx=10, pady=5)
 
         ctk.CTkLabel(self.file_frame, text="1. Load 3D Model:").pack(anchor="w", padx=5)
         self.input_btn = ctk.CTkButton(self.file_frame, text="Open STL/OBJ/3DS", command=self.browse_input)
         self.input_btn.pack(fill="x", padx=5, pady=5)
 
-        self.comp_frame = ctk.CTkFrame(self.left_panel)
+        self.comp_frame = ctk.CTkFrame(self.controls_frame)
         self.comp_frame.pack(fill="x", padx=10, pady=5)
         ctk.CTkLabel(self.comp_frame, text="2. Select Surface:").pack(anchor="w", padx=5)
         self.comp_menu = ctk.CTkOptionMenu(self.comp_frame, values=["No model loaded"], command=self.on_component_select)
@@ -90,7 +98,7 @@ class FlattenApp(ctk.CTk):
         )
         self.face_pick_switch.pack(side="right")
 
-        self.opt_frame = ctk.CTkFrame(self.left_panel)
+        self.opt_frame = ctk.CTkFrame(self.controls_frame)
         self.opt_frame.pack(fill="x", padx=10, pady=5)
 
         ctk.CTkLabel(self.opt_frame, text="3. Input Units:").pack(anchor="w", padx=5)
@@ -153,7 +161,7 @@ class FlattenApp(ctk.CTk):
         self.relief_threshold_entry = ctk.CTkEntry(self.opt_frame, textvariable=self.relief_threshold_var)
         self.relief_threshold_entry.pack(fill="x", padx=5, pady=(0, 6))
 
-        self.out_frame = ctk.CTkFrame(self.left_panel)
+        self.out_frame = ctk.CTkFrame(self.controls_frame)
         self.out_frame.pack(fill="x", padx=10, pady=5)
         ctk.CTkLabel(self.out_frame, text="7. Output:").pack(anchor="w", padx=5)
         self.out_btn = ctk.CTkButton(self.out_frame, text="Set Export Path", command=self.browse_output)
@@ -162,7 +170,7 @@ class FlattenApp(ctk.CTk):
         self.out_label.pack(fill="x", padx=5)
 
         self.run_btn = ctk.CTkButton(
-            self.left_panel,
+            self.actions_frame,
             text="GENERATE PRODUCTION DXF",
             command=self.run_flattening,
             height=60,
@@ -170,10 +178,10 @@ class FlattenApp(ctk.CTk):
             fg_color="green",
             hover_color="darkgreen",
         )
-        self.run_btn.pack(pady=30, padx=10, fill="x")
+        self.run_btn.pack(pady=(10, 10), padx=10, fill="x")
 
-        self.status_label = ctk.CTkLabel(self.left_panel, text="Ready", wraplength=320, justify="left")
-        self.status_label.pack(pady=10)
+        self.status_label = ctk.CTkLabel(self.actions_frame, text="Ready", wraplength=320, justify="left")
+        self.status_label.pack(pady=(0, 8), padx=10, anchor="w")
 
         self.right_panel = ctk.CTkFrame(self)
         self.right_panel.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
@@ -483,13 +491,16 @@ class FlattenApp(ctk.CTk):
             strain = self._get_component_strain(idx)
             if len(strain) > 0:
                 strain_preview = strain[face_indices]
-                collection.set_cmap("RdYlGn_r")
-                collection.set_array(strain_preview)
-                collection.set_norm(Normalize(vmin=0.0, vmax=3.0))
+                cmap = cm.get_cmap("RdYlGn_r")
+                norm = Normalize(vmin=0.0, vmax=3.0, clip=True)
+                facecolors = cmap(norm(strain_preview))
+                collection.set_facecolor(facecolors)
                 collection.set_edgecolor("none")
                 collection.set_linewidth(0.0)
                 self._clear_heatmap_colorbar()
-                self._heatmap_colorbar = self.fig.colorbar(collection, ax=self.ax, fraction=0.03, pad=0.02)
+                sm = cm.ScalarMappable(norm=norm, cmap=cmap)
+                sm.set_array([])
+                self._heatmap_colorbar = self.fig.colorbar(sm, ax=self.ax, fraction=0.03, pad=0.02)
                 self._heatmap_colorbar.set_label("Strain % (Green=0, Red>3)")
         else:
             self._clear_heatmap_colorbar()

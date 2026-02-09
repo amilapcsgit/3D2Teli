@@ -1,8 +1,7 @@
 import igl
 import numpy as np
 
-from .geometry import plane_through_3_points, rotate_points, rotation_matrix_from_vectors, \
-    plane_normal_vector, find_boundary_loop
+from .geometry import plane_through_3_points, rotate_points, rotation_matrix_from_vectors, plane_normal_vector
 
 
 def init_unfold(vertices, faces, id_vertex):
@@ -50,6 +49,13 @@ def unfold(vertices, faces, init_points_ids, init_points_pos, method="LSCM"):
         # igl.arap_precomputation(V, F, dim, b)
         # We use dim=2 for parameterization
         arap_data = igl.ARAPData()
+        # Keep solve time practical for large production meshes.
+        if f.shape[0] > 50000:
+            arap_data.max_iter = 12
+        elif f.shape[0] > 20000:
+            arap_data.max_iter = 20
+        else:
+            arap_data.max_iter = 30
         # ARAPEnergyType: 0: Spokes, 1: Spokes-and-rims, 2: Elements (default)
         igl.arap_precomputation(v, f, 2, b, arap_data)
 
@@ -65,31 +71,58 @@ def unfold(vertices, faces, init_points_ids, init_points_pos, method="LSCM"):
 
 def get_all_bounds(faces):
     res = igl.boundary_facets(faces)
-    if isinstance(res, tuple):
-        boundary_facets = res[0]
-    else:
-        boundary_facets = res
+    boundary_facets = res[0] if isinstance(res, tuple) else res
+    if boundary_facets is None or len(boundary_facets) == 0:
+        return []
 
-    adjacency_list = {}
+    adjacency = {}
+    edges = set()
     for edge in boundary_facets:
         u, v = int(edge[0]), int(edge[1])
-        if u not in adjacency_list:
-            adjacency_list[u] = []
-        if v not in adjacency_list:
-            adjacency_list[v] = []
-        adjacency_list[u].append(v)
-        adjacency_list[v].append(u)
-    all_boundary_loops = []
-    visited = set()
-    for edge in boundary_facets:
-        u = int(edge[0])
-        if u not in visited:
-            loop, adjacency_list = find_boundary_loop(u, adjacency_list)
-            all_boundary_loops.append(loop)
-            visited.update(loop)
-        v = int(edge[1])
-        if v not in visited:
-            loop, adjacency_list = find_boundary_loop(v, adjacency_list)
-            all_boundary_loops.append(loop)
-            visited.update(loop)
-    return all_boundary_loops
+        if u == v:
+            continue
+        adjacency.setdefault(u, []).append(v)
+        adjacency.setdefault(v, []).append(u)
+        edges.add(tuple(sorted((u, v))))
+
+    loops = []
+    visited_edges = set()
+
+    for edge in list(edges):
+        if edge in visited_edges:
+            continue
+
+        start, current = edge
+        loop = [start, current]
+        visited_edges.add(edge)
+        prev = start
+
+        # Keep traversal bounded by number of boundary edges.
+        for _ in range(len(edges) + 1):
+            neighbors = adjacency.get(current, [])
+            next_vertex = None
+            for candidate in neighbors:
+                if candidate == prev:
+                    continue
+                cand_edge = tuple(sorted((current, candidate)))
+                if cand_edge not in visited_edges:
+                    next_vertex = candidate
+                    break
+
+            if next_vertex is None:
+                # Open chain end.
+                break
+
+            cand_edge = tuple(sorted((current, next_vertex)))
+            visited_edges.add(cand_edge)
+
+            if next_vertex == start:
+                break
+
+            loop.append(next_vertex)
+            prev, current = current, next_vertex
+
+        if len(loop) >= 3:
+            loops.append(loop)
+
+    return loops

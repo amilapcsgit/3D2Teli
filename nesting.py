@@ -314,18 +314,23 @@ def _write_sheet(path: Path, placements: List[Placement], sheet_index: int):
     doc.saveas(path)
 
 
-def run_nesting(
+def _group_compact_sheets(placements: List[Placement]) -> Dict[int, List[Placement]]:
+    by_sheet: Dict[int, List[Placement]] = {}
+    for pl in placements:
+        by_sheet.setdefault(pl.sheet_index, []).append(pl)
+    non_empty_keys = sorted(k for k, v in by_sheet.items() if v)
+    compact_index = {old: new for new, old in enumerate(non_empty_keys)}
+    return {compact_index[k]: by_sheet[k] for k in non_empty_keys}
+
+
+def build_nesting_layout(
     input_dir: str,
-    output_dir: str,
     roll_width_mm: float = 2500.0,
     gap_mm: float = 20.0,
     rotation_step_deg: float = 15.0,
     max_sheet_length_mm: float = 10000.0,
 ) -> Dict:
     source = Path(input_dir)
-    target = Path(output_dir)
-    target.mkdir(parents=True, exist_ok=True)
-
     pieces = _read_pieces(source)
     if not pieces:
         raise ValueError("No valid DXF pieces with CUT_LINE found in input folder.")
@@ -337,34 +342,57 @@ def run_nesting(
         rotation_step_deg=float(rotation_step_deg),
         max_sheet_length=float(max_sheet_length_mm),
     )
-
-    by_sheet: Dict[int, List[Placement]] = {}
-    for pl in placements:
-        by_sheet.setdefault(pl.sheet_index, []).append(pl)
-
-    # Compact non-empty sheets to 0..N-1 in order.
-    non_empty_keys = sorted(k for k, v in by_sheet.items() if v)
-    compact_index = {old: new for new, old in enumerate(non_empty_keys)}
-    by_sheet_compact: Dict[int, List[Placement]] = {compact_index[k]: by_sheet[k] for k in non_empty_keys}
-
-    sheet_files = []
-    if len(by_sheet_compact) == 1:
-        out = target / "MASTER_PRODUCTION_ROLL.dxf"
-        _write_sheet(out, by_sheet_compact[0], 0)
-        sheet_files.append(str(out))
-    else:
-        for i in sorted(by_sheet_compact):
-            out = target / f"MASTER_PRODUCTION_ROLL_SHEET_{i+1:02d}.dxf"
-            _write_sheet(out, by_sheet_compact[i], i)
-            sheet_files.append(str(out))
-
-    used_lengths = {}
-    for i, ps in by_sheet_compact.items():
-        used_lengths[i] = max(float(p.placed_polygon.bounds[3]) for p in ps) if ps else 0.0
-
+    by_sheet_compact = _group_compact_sheets(placements)
+    used_lengths = {
+        i: max(float(p.placed_polygon.bounds[3]) for p in ps) if ps else 0.0
+        for i, ps in by_sheet_compact.items()
+    }
     return {
+        "placements_by_sheet": by_sheet_compact,
+        "roll_width_mm": float(roll_width_mm),
+        "gap_mm": float(gap_mm),
+        "max_sheet_length_mm": float(max_sheet_length_mm),
         "input_count": len(pieces),
         "sheet_count": len(by_sheet_compact),
-        "sheet_files": sheet_files,
         "used_length_mm_per_sheet": used_lengths,
+    }
+
+
+def export_nesting_layout(output_dir: str, placements_by_sheet: Dict[int, List[Placement]]) -> List[str]:
+    target = Path(output_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    sheet_files: List[str] = []
+    if len(placements_by_sheet) == 1 and 0 in placements_by_sheet:
+        out = target / "MASTER_PRODUCTION_ROLL.dxf"
+        _write_sheet(out, placements_by_sheet[0], 0)
+        sheet_files.append(str(out))
+    else:
+        for i in sorted(placements_by_sheet):
+            out = target / f"MASTER_PRODUCTION_ROLL_SHEET_{i+1:02d}.dxf"
+            _write_sheet(out, placements_by_sheet[i], i)
+            sheet_files.append(str(out))
+    return sheet_files
+
+
+def run_nesting(
+    input_dir: str,
+    output_dir: str,
+    roll_width_mm: float = 2500.0,
+    gap_mm: float = 20.0,
+    rotation_step_deg: float = 15.0,
+    max_sheet_length_mm: float = 10000.0,
+) -> Dict:
+    layout = build_nesting_layout(
+        input_dir=input_dir,
+        roll_width_mm=roll_width_mm,
+        gap_mm=gap_mm,
+        rotation_step_deg=rotation_step_deg,
+        max_sheet_length_mm=max_sheet_length_mm,
+    )
+    sheet_files = export_nesting_layout(output_dir=output_dir, placements_by_sheet=layout["placements_by_sheet"])
+    return {
+        "input_count": layout["input_count"],
+        "sheet_count": layout["sheet_count"],
+        "sheet_files": sheet_files,
+        "used_length_mm_per_sheet": layout["used_length_mm_per_sheet"],
     }

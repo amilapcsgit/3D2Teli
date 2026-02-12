@@ -86,10 +86,29 @@ class Worker(QObject):
             raise ValueError("Model has no valid triangles.")
 
         preview_faces = faces
+        preview_indices = np.arange(len(faces), dtype=np.int64)
         if len(faces) > 120000:
             step = int(math.ceil(len(faces) / 120000.0))
             preview_faces = faces[::step]
+            preview_indices = preview_indices[::step]
         self.progress.emit(70)
+
+        vertex_colors = None
+        preview_face_colors = None
+        try:
+            visual = getattr(mesh, "visual", None)
+            visual_defined = bool(getattr(visual, "defined", False)) if visual is not None else False
+            if visual is not None and visual_defined:
+                raw_vc = np.asarray(getattr(visual, "vertex_colors", []))
+                if raw_vc.ndim == 2 and raw_vc.shape[0] == len(vertices) and raw_vc.shape[1] in (3, 4):
+                    vertex_colors = raw_vc[:, :4]
+
+                raw_fc = np.asarray(getattr(visual, "face_colors", []))
+                if raw_fc.ndim == 2 and raw_fc.shape[0] == len(faces) and raw_fc.shape[1] in (3, 4):
+                    preview_face_colors = raw_fc[preview_indices, :4]
+        except Exception:
+            vertex_colors = None
+            preview_face_colors = None
 
         edges_sorted = np.sort(mesh.edges_sorted, axis=1)
         _, edge_use_counts = np.unique(edges_sorted, axis=0, return_counts=True)
@@ -102,6 +121,8 @@ class Worker(QObject):
             "vertices": vertices,
             "faces": faces,
             "preview_faces": preview_faces,
+            "vertex_colors": vertex_colors,
+            "preview_face_colors": preview_face_colors,
             "mesh_checks": {
                 "open_edges": open_edges,
                 "non_manifold_edges": non_manifold_edges,
@@ -782,6 +803,8 @@ class RibbonMainWindow(QMainWindow):
         vertices = np.asarray(payload["vertices"], dtype=np.float64)
         faces = np.asarray(payload["faces"], dtype=np.int64)
         preview_faces = np.asarray(payload["preview_faces"], dtype=np.int64)
+        vertex_colors = payload.get("vertex_colors")
+        preview_face_colors = payload.get("preview_face_colors")
         self.loaded_model_path = path
         self.loaded_vertices = vertices
         self.loaded_faces = faces
@@ -789,7 +812,15 @@ class RibbonMainWindow(QMainWindow):
         self.loaded_mesh_checks = dict(payload.get("mesh_checks", {}))
 
         dims = self._dims_in_mm(vertices)
-        self.viewport.set_mesh(Path(path).name, vertices, preview_faces, dims, pick_faces=faces)
+        self.viewport.set_mesh(
+            Path(path).name,
+            vertices,
+            preview_faces,
+            dims,
+            pick_faces=faces,
+            vertex_colors=None if vertex_colors is None else np.asarray(vertex_colors),
+            face_colors=None if preview_face_colors is None else np.asarray(preview_face_colors),
+        )
         self._position_viewcube()
         self._on_viewport_camera_changed(24.0, -58.0)
         self.scale_label.setText(f"Scale: {dims[0]:.1f} x {dims[1]:.1f} x {dims[2]:.1f} mm")

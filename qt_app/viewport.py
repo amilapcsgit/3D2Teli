@@ -1,19 +1,17 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from collections import deque
 import math
 from typing import Dict, List, Set, Tuple
 
 import numpy as np
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from matplotlib.figure import Figure
-from mpl_toolkits.mplot3d import proj3d
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import pyqtgraph.opengl as gl
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtWidgets import QLabel, QMenu, QToolButton, QVBoxLayout, QWidget
+from PySide6.QtGui import QVector3D, QVector4D
+from PySide6.QtWidgets import QLabel, QMenu, QSizePolicy, QToolButton, QVBoxLayout, QWidget
 
 
-class ThreeDViewportWidget(QWidget):
+class ThreeDViewportWidget(gl.GLViewWidget):
     cameraChanged = Signal(float, float)
     facesSelected = Signal(list)
     modelDropped = Signal(str)
@@ -22,56 +20,66 @@ class ThreeDViewportWidget(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setObjectName("ThreeDViewportWidget")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
         self.setAcceptDrops(True)
-        self.setStyleSheet("background-color: #252525; border: none;")
+        self.setMinimumSize(100, 100)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setBackgroundColor((43, 43, 43, 255))
+        self.setStyleSheet("QOpenGLWidget#ThreeDViewportWidget { border: none; outline: none; background-color: #2b2b2b; }")
 
         self.vertices: np.ndarray | None = None
+        self.vertices32: np.ndarray | None = None
         self.render_faces: np.ndarray | None = None
+        self.render_faces32: np.ndarray | None = None
         self.pick_faces: np.ndarray | None = None
         self.mesh_name = ""
         self.selection_mode = "single"
         self.selected_faces: Set[int] = set()
         self._drag_start: Tuple[float, float] | None = None
+        self._left_dragging = False
         self._face_normals: np.ndarray | None = None
         self._face_adjacency: List[List[int]] | None = None
         self._pick_cache_token = None
-        self._camera_position: Tuple[float, float, float] | None = None
         self._camera_up: Tuple[float, float, float] | None = None
+        self._nav_last: Tuple[float, float] | None = None
         self.is_rotating = False
         self.is_panning = False
         self.is_zooming = False
-        self._nav_last: Tuple[float, float] | None = None
         self.orbit_mode_enabled = True
         self.pan_mode_enabled = False
         self.zoom_mode_enabled = False
+        self._base_render_face_colors: np.ndarray | None = None
+        self._pick_to_render: np.ndarray | None = None
+        self._pick_tri_a: np.ndarray | None = None
+        self._pick_e1: np.ndarray | None = None
+        self._pick_e2: np.ndarray | None = None
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        self.grid_item = gl.GLGridItem(color=(85, 85, 85, 110))
+        self.grid_item.setSize(x=12000.0, y=12000.0, z=1.0)
+        self.grid_item.setSpacing(10.0, 10.0, 1.0)
+        self.addItem(self.grid_item)
 
-        self.fig = Figure(figsize=(7, 5), facecolor="#252525")
-        self.canvas = FigureCanvasQTAgg(self.fig)
-        self.canvas.setStyleSheet("background-color: #252525; border: none;")
-        self.ax = self.fig.add_subplot(111, projection="3d")
-        self.ax.set_facecolor("#252525")
-        self.ax.set_proj_type("ortho")
-        self.ax.set_axis_off()
-        layout.addWidget(self.canvas, 1)
+        self.mesh_item = gl.GLMeshItem(drawFaces=True, drawEdges=False, smooth=False, shader="shaded")
+        self.mesh_item.setGLOptions("opaque")
+        self.addItem(self.mesh_item)
+
+        self.selection_item = gl.GLMeshItem(drawFaces=True, drawEdges=False, smooth=False, shader="shaded", glOptions="translucent")
+        self.selection_item.setVisible(False)
+        self.addItem(self.selection_item)
 
         self.overlay = QLabel("Drop 3D Model Here\n(STL / OBJ / STEP)", self)
         self.overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.overlay.setStyleSheet(
-            "QLabel { color:#8fa0b7; font-size:24px; font-weight:600; background:transparent; }"
-        )
+        self.overlay.setStyleSheet("QLabel { color:#8fa0b7; font-size:24px; font-weight:600; background:transparent; }")
         self.overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        layout.addWidget(self.overlay, 0, Qt.AlignmentFlag.AlignCenter)
 
         self.dim_label = QLabel("", self)
         self.dim_label.setStyleSheet(
             "QLabel { color:#d5deec; background-color:rgba(20,22,28,170); border:1px solid #3a4250; padding:4px 8px; }"
         )
         self.dim_label.move(14, 14)
-        self.dim_label.resize(400, 28)
+        self.dim_label.setMinimumSize(220, 28)
         self.dim_label.show()
 
         self._camera_debounce = QTimer(self)
@@ -79,26 +87,131 @@ class ThreeDViewportWidget(QWidget):
         self._camera_debounce.setInterval(35)
         self._camera_debounce.timeout.connect(self._emit_camera_changed)
 
-        self.canvas.mpl_connect("button_press_event", self._on_mouse_press)
-        self.canvas.mpl_connect("button_release_event", self._on_mouse_release)
-        self.canvas.mpl_connect("motion_notify_event", self._on_mouse_motion)
-        self.canvas.mpl_connect("scroll_event", self._on_camera_event)
-        self.canvas.mpl_connect("draw_event", self._on_camera_event)
         self._build_hud()
+        self.clear_view()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         self.overlay.setGeometry(self.rect())
         self.dim_label.raise_()
         self._position_hud()
+        self._update_grid_extent()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
+        pos = event.position()
+        self._nav_last = (float(pos.x()), float(pos.y()))
+        self._drag_start = (float(pos.x()), float(pos.y()))
+        self._left_dragging = False
+
+        if event.button() == Qt.MouseButton.RightButton and self.orbit_mode_enabled:
+            self.is_rotating = True
+            self.is_panning = False
+            self.is_zooming = False
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self.is_panning = True
+            self.is_rotating = False
+            self.is_zooming = False
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self.pan_mode_enabled:
+            self.is_panning = True
+            self.is_rotating = False
+            self.is_zooming = False
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self.zoom_mode_enabled:
+            self.is_zooming = True
+            self.is_rotating = False
+            self.is_panning = False
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            event.accept()
+            return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        if self.is_rotating or self.is_panning or self.is_zooming:
+        cur = (float(event.position().x()), float(event.position().y()))
+        if self._nav_last is None:
+            self._nav_last = cur
+        dx = cur[0] - self._nav_last[0]
+        dy = cur[1] - self._nav_last[1]
+        self._nav_last = cur
+
+        if self.is_rotating:
+            self.orbit(-dx, dy)
+            self._on_camera_event()
+            event.accept()
+            return
+        if self.is_panning:
+            self.pan(dx, dy, 0.0, relative="view-upright")
+            self._on_camera_event()
+            event.accept()
+            return
+        if self.is_zooming:
+            self._zoom_camera_by_delta(dy)
+            self._on_camera_event()
+            event.accept()
+            return
+        if (event.buttons() & Qt.MouseButton.LeftButton) and self._drag_start is not None:
+            ddx = cur[0] - self._drag_start[0]
+            ddy = cur[1] - self._drag_start[1]
+            if (ddx * ddx + ddy * ddy) > 25.0:
+                self._left_dragging = True
+            event.accept()
             return
         super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.RightButton and self.is_rotating:
+            self.is_rotating = False
+            self._nav_last = None
+            self._on_camera_event()
+            event.accept()
+            return
+        if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton) and self.is_panning:
+            self.is_panning = False
+            self._nav_last = None
+            self._on_camera_event()
+            event.accept()
+            return
+        if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton) and self.is_zooming:
+            self.is_zooming = False
+            self._nav_last = None
+            self._on_camera_event()
+            event.accept()
+            return
+
+        if event.button() == Qt.MouseButton.LeftButton:
+            try:
+                if self.selection_mode == "off" or self.vertices is None or self.pick_faces is None or self._left_dragging:
+                    event.accept()
+                    return
+                hit = self._raycast_face(float(event.position().x()), float(event.position().y()))
+                if hit is None:
+                    event.accept()
+                    return
+                self.selected_faces = {int(hit)} if self.selection_mode == "single" else self.smart_select(int(hit), 30.0)
+                self._update_mesh_visuals()
+                self.facesSelected.emit(self.get_selected_faces())
+                event.accept()
+                return
+            finally:
+                self._drag_start = None
+                self._left_dragging = False
+        super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        delta = int(event.angleDelta().x()) or int(event.angleDelta().y())
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.opts["fov"] = float(np.clip(self.opts["fov"] * (0.999 ** delta), 5.0, 120.0))
+        else:
+            self.opts["distance"] = float(np.clip(self.opts["distance"] * (0.999 ** delta), 1e-3, 1e12))
+        self.update()
+        self._on_camera_event()
+        event.accept()
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802
         if event.mimeData().hasUrls():
@@ -112,185 +225,136 @@ class ThreeDViewportWidget(QWidget):
 
     def dropEvent(self, event) -> None:  # noqa: N802
         urls = event.mimeData().urls()
-        if not urls:
+        if urls:
+            self.modelDropped.emit(urls[0].toLocalFile())
+            event.acceptProposedAction()
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        if self.vertices is None or self.is_rotating or self.is_panning or self.is_zooming:
             return
-        path = urls[0].toLocalFile()
-        self.modelDropped.emit(path)
-        event.acceptProposedAction()
+        menu = QMenu(self)
+        flatten_action = menu.addAction("Flatten Selected")
+        if menu.exec(event.globalPos()) == flatten_action:
+            self.flattenRequested.emit()
 
     def _build_hud(self) -> None:
         self.hud = QWidget(self)
         self.hud.setObjectName("ViewportHUD")
         self.hud.setStyleSheet(
             """
-            QWidget#ViewportHUD {
-                background-color: rgba(0, 0, 0, 150);
-                border-radius: 8px;
-            }
-            QToolButton {
-                min-width: 30px;
-                min-height: 30px;
-                max-width: 30px;
-                max-height: 30px;
-                color: #f2f2f2;
-                background-color: #2a2a2a;
-                border: 1px solid #565656;
-                border-radius: 4px;
-                font-size: 15px;
-            }
-            QToolButton:checked {
-                border-color: #cfcfcf;
-                background-color: #3c3c3c;
-            }
+            QWidget#ViewportHUD { background-color: rgba(0, 0, 0, 150); border-radius: 8px; }
+            QToolButton { min-width:30px; min-height:30px; max-width:30px; max-height:30px; color:#f2f2f2; background-color:#2a2a2a; border:1px solid #565656; border-radius:4px; font-size:15px; }
+            QToolButton:checked { border-color:#cfcfcf; background-color:#3c3c3c; }
             """
         )
         hud_layout = QVBoxLayout(self.hud)
         hud_layout.setContentsMargins(8, 8, 8, 8)
         hud_layout.setSpacing(6)
-
         self.hud_fit_btn = QToolButton(self.hud)
         self.hud_fit_btn.setText("\u26F6")
         self.hud_fit_btn.setToolTip("Zoom Fit")
         self.hud_fit_btn.clicked.connect(self.reset_camera)
-
         self.hud_pan_btn = QToolButton(self.hud)
         self.hud_pan_btn.setText("\u270B")
         self.hud_pan_btn.setToolTip("Pan Mode")
         self.hud_pan_btn.setCheckable(True)
         self.hud_pan_btn.toggled.connect(self._toggle_pan_mode)
-
         self.hud_zoom_btn = QToolButton(self.hud)
         self.hud_zoom_btn.setText("\u21F5")
         self.hud_zoom_btn.setToolTip("Zoom Drag Mode")
         self.hud_zoom_btn.setCheckable(True)
         self.hud_zoom_btn.toggled.connect(self._toggle_zoom_mode)
-
         self.hud_orbit_btn = QToolButton(self.hud)
         self.hud_orbit_btn.setText("\u21BB")
         self.hud_orbit_btn.setToolTip("Orbit Mode")
         self.hud_orbit_btn.setCheckable(True)
         self.hud_orbit_btn.setChecked(True)
         self.hud_orbit_btn.toggled.connect(self._toggle_orbit_mode)
-
         self.hud_split_btn = QToolButton(self.hud)
         self.hud_split_btn.setText("\u25EB")
         self.hud_split_btn.setToolTip("Toggle 2D Preview")
         self.hud_split_btn.clicked.connect(self.splitToggleRequested.emit)
-
-        hud_layout.addWidget(self.hud_fit_btn)
-        hud_layout.addWidget(self.hud_pan_btn)
-        hud_layout.addWidget(self.hud_zoom_btn)
-        hud_layout.addWidget(self.hud_orbit_btn)
-        hud_layout.addWidget(self.hud_split_btn)
+        for w in (self.hud_fit_btn, self.hud_pan_btn, self.hud_zoom_btn, self.hud_orbit_btn, self.hud_split_btn):
+            hud_layout.addWidget(w)
         self.hud.adjustSize()
         self.hud.show()
         self._position_hud()
 
     def _position_hud(self) -> None:
         margin = 16
-        x = max(0, self.width() - self.hud.width() - margin)
-        y = max(0, self.height() - self.hud.height() - margin)
-        self.hud.move(x, y)
+        self.hud.move(max(0, self.width() - self.hud.width() - margin), max(0, self.height() - self.hud.height() - margin))
         self.hud.raise_()
         self.dim_label.raise_()
 
     def _toggle_pan_mode(self, enabled: bool) -> None:
         self.pan_mode_enabled = bool(enabled)
-        if self.pan_mode_enabled and self.hud_orbit_btn.isChecked():
+        if enabled:
             self.hud_orbit_btn.blockSignals(True)
             self.hud_orbit_btn.setChecked(False)
             self.hud_orbit_btn.blockSignals(False)
-            self.orbit_mode_enabled = False
-        if self.pan_mode_enabled and self.hud_zoom_btn.isChecked():
             self.hud_zoom_btn.blockSignals(True)
             self.hud_zoom_btn.setChecked(False)
             self.hud_zoom_btn.blockSignals(False)
+            self.orbit_mode_enabled = False
             self.zoom_mode_enabled = False
         self.is_panning = False
         self._nav_last = None
 
     def _toggle_orbit_mode(self, enabled: bool) -> None:
         self.orbit_mode_enabled = bool(enabled)
-        if self.orbit_mode_enabled and self.hud_pan_btn.isChecked():
+        if enabled:
             self.hud_pan_btn.blockSignals(True)
             self.hud_pan_btn.setChecked(False)
             self.hud_pan_btn.blockSignals(False)
-            self.pan_mode_enabled = False
-        if self.orbit_mode_enabled and self.hud_zoom_btn.isChecked():
             self.hud_zoom_btn.blockSignals(True)
             self.hud_zoom_btn.setChecked(False)
             self.hud_zoom_btn.blockSignals(False)
+            self.pan_mode_enabled = False
             self.zoom_mode_enabled = False
         self.is_rotating = False
         self._nav_last = None
 
     def _toggle_zoom_mode(self, enabled: bool) -> None:
         self.zoom_mode_enabled = bool(enabled)
-        if self.zoom_mode_enabled and self.hud_pan_btn.isChecked():
+        if enabled:
             self.hud_pan_btn.blockSignals(True)
             self.hud_pan_btn.setChecked(False)
             self.hud_pan_btn.blockSignals(False)
-            self.pan_mode_enabled = False
-        if self.zoom_mode_enabled and self.hud_orbit_btn.isChecked():
             self.hud_orbit_btn.blockSignals(True)
             self.hud_orbit_btn.setChecked(False)
             self.hud_orbit_btn.blockSignals(False)
+            self.pan_mode_enabled = False
             self.orbit_mode_enabled = False
         self.is_zooming = False
         self._nav_last = None
 
-    def _pan_camera_by_delta(self, dx: float, dy: float) -> None:
-        x0, x1 = self.ax.get_xlim3d()
-        y0, y1 = self.ax.get_ylim3d()
-        z0, z1 = self.ax.get_zlim3d()
-        w = max(1.0, float(self.canvas.width()))
-        h = max(1.0, float(self.canvas.height()))
-        sx = -(dx / w) * (x1 - x0)
-        sy = (dy / h) * (y1 - y0)
-        self.ax.set_xlim3d(x0 + sx, x1 + sx)
-        self.ax.set_ylim3d(y0 + sy, y1 + sy)
-        self.ax.set_zlim3d(z0, z1)
-
-    def _orbit_camera_by_delta(self, dx: float, dy: float) -> None:
-        elev = float(self.ax.elev) - dy * 0.28
-        azim = float(self.ax.azim) - dx * 0.32
-        roll = float(getattr(self.ax, "roll", 0.0))
-        self._set_camera_view(elev=elev, azim=azim, roll=roll, emit_signal=False)
-
     def _zoom_camera_by_delta(self, dy: float) -> None:
-        factor = 1.0 + (float(dy) * 0.01)
-        factor = max(0.2, min(5.0, factor))
-        for getter, setter in (
-            (self.ax.get_xlim3d, self.ax.set_xlim3d),
-            (self.ax.get_ylim3d, self.ax.set_ylim3d),
-            (self.ax.get_zlim3d, self.ax.set_zlim3d),
-        ):
-            lo, hi = getter()
-            mid = (lo + hi) * 0.5
-            half = max(1e-9, (hi - lo) * 0.5 * factor)
-            setter(mid - half, mid + half)
+        self.opts["distance"] = float(np.clip(self.opts["distance"] * (1.0 + dy * 0.01), 1e-3, 1e12))
+        self.update()
 
     def clear_view(self) -> None:
         self.vertices = None
+        self.vertices32 = None
         self.render_faces = None
+        self.render_faces32 = None
         self.pick_faces = None
         self.selected_faces.clear()
         self._face_normals = None
         self._face_adjacency = None
         self._pick_cache_token = None
-        self._camera_position = None
-        self._camera_up = None
-        self.is_rotating = False
-        self.is_panning = False
-        self.is_zooming = False
-        self._nav_last = None
-        self.ax.clear()
-        self.ax.set_facecolor("#252525")
-        self.ax.set_proj_type("ortho")
-        self.ax.set_axis_off()
-        self.canvas.draw_idle()
+        self._base_render_face_colors = None
+        self._pick_to_render = None
+        self._pick_tri_a = None
+        self._pick_e1 = None
+        self._pick_e2 = None
+        self.mesh_item.setMeshData(vertexes=np.empty((0, 3), np.float32), faces=np.empty((0, 3), np.int32), shader="shaded", smooth=False)
+        self.selection_item.setVisible(False)
+        self.setCameraPosition(pos=QVector3D(0.0, 0.0, 0.0), distance=600.0, elevation=24.0, azimuth=-58.0)
+        self.opts["fov"] = 45.0
+        self._update_grid_extent()
         self.overlay.show()
         self.dim_label.setText("")
+        self.update()
 
     def set_mesh(
         self,
@@ -302,303 +366,246 @@ class ThreeDViewportWidget(QWidget):
     ) -> None:
         self.mesh_name = name
         self.vertices = np.asarray(vertices, dtype=np.float64)
+        self.vertices32 = np.ascontiguousarray(self.vertices.astype(np.float32, copy=False))
         self.render_faces = np.asarray(render_faces, dtype=np.int64)
+        self.render_faces32 = np.ascontiguousarray(self.render_faces.astype(np.int32, copy=False))
         self.pick_faces = np.asarray(pick_faces, dtype=np.int64) if pick_faces is not None else self.render_faces
         self.selected_faces.clear()
         self._face_normals = None
         self._face_adjacency = None
         self._pick_cache_token = (len(self.vertices), len(self.pick_faces))
+        self._base_render_face_colors = self._build_default_face_colors()
+        self._build_pick_to_render_map()
+        self._prepare_pick_raycast_cache()
+        self._update_mesh_visuals()
+        self._fit_camera_to_mesh()
+        self._update_grid_extent()
+        self.overlay.hide()
         lx, ly, lz = dims_mm
         self.dim_label.setText(f"{name} | LxWxH: {lx:.1f} x {ly:.1f} x {lz:.1f} mm")
-        self._redraw_mesh(reset_camera=True)
+        self._on_camera_event()
 
-    def reset_camera(self) -> None:
+    def _fit_camera_to_mesh(self) -> None:
         if self.vertices is None:
             return
-        self._camera_position = None
-        self._camera_up = None
-        self._set_camera_view(elev=24.0, azim=-58.0, roll=0.0)
+        mins = self.vertices.min(axis=0)
+        maxs = self.vertices.max(axis=0)
+        center = (mins + maxs) * 0.5
+        span_xyz = maxs - mins
+        span = float(max(np.max(span_xyz), np.linalg.norm(span_xyz), 1.0))
+        self.setCameraPosition(pos=QVector3D(float(center[0]), float(center[1]), float(center[2])), distance=max(span * 1.8, 20.0), elevation=24.0, azimuth=-58.0)
+        self.opts["fov"] = 40.0
+        self.update()
+
+    def reset_camera(self) -> None:
+        self._fit_camera_to_mesh() if self.vertices is not None else self.clear_view()
+        self._on_camera_event()
 
     def apply_view_preset(self, preset: str) -> None:
         if self.vertices is None:
             return
-        bounds = self.vertices.max(axis=0) - self.vertices.min(axis=0)
-        dist = max(float(np.max(bounds)), 1.0) * 1.8
-
-        presets = {
-            "FRONT": ((0.0, -dist, 0.0), (0.0, 0.0, 1.0), 0.0, -90.0, 0.0),
-            "BACK": ((0.0, dist, 0.0), (0.0, 0.0, 1.0), 0.0, 90.0, 0.0),
-            "LEFT": ((-dist, 0.0, 0.0), (0.0, 0.0, 1.0), 0.0, 180.0, 0.0),
-            "RIGHT": ((dist, 0.0, 0.0), (0.0, 0.0, 1.0), 0.0, 0.0, 0.0),
-            "TOP": ((0.0, 0.0, dist), (0.0, 1.0, 0.0), 90.0, -90.0, 0.0),
-            "BOTTOM": ((0.0, 0.0, -dist), (0.0, -1.0, 0.0), -90.0, -90.0, 180.0),
+        mins = self.vertices.min(axis=0)
+        maxs = self.vertices.max(axis=0)
+        center = (mins + maxs) * 0.5
+        dist = max(float(np.max(maxs - mins)) * 2.2, 20.0)
+        mapping = {
+            "FRONT": (0.0, -90.0, (0.0, 0.0, 1.0)),
+            "BACK": (0.0, 90.0, (0.0, 0.0, 1.0)),
+            "LEFT": (0.0, 180.0, (0.0, 0.0, 1.0)),
+            "RIGHT": (0.0, 0.0, (0.0, 0.0, 1.0)),
+            "TOP": (90.0, -90.0, (0.0, 1.0, 0.0)),
+            "BOTTOM": (-90.0, -90.0, (0.0, -1.0, 0.0)),
         }
-        if preset not in presets:
+        if preset not in mapping:
             return
-
-        pos, up, elev, azim, roll = presets[preset]
-        # Equivalent to camera.setParams: keep explicit position + up-vector state.
-        self._camera_position = (float(pos[0]), float(pos[1]), float(pos[2]))
-        self._camera_up = (float(up[0]), float(up[1]), float(up[2]))
-        self._set_camera_view(elev=elev, azim=azim, roll=roll)
-
-    def _set_camera_view(self, elev: float, azim: float, roll: float = 0.0, emit_signal: bool = True) -> None:
-        try:
-            self.ax.view_init(elev=elev, azim=azim, roll=roll)
-        except TypeError:
-            self.ax.view_init(elev=elev, azim=azim)
-        self.canvas.draw_idle()
-        if emit_signal:
-            self._emit_camera_changed()
+        elev, azim, up = mapping[preset]
+        self.setCameraPosition(pos=QVector3D(float(center[0]), float(center[1]), float(center[2])), distance=dist, elevation=elev, azimuth=azim)
+        self.opts["fov"] = 40.0
+        self._camera_up = up
+        self.update()
+        self._on_camera_event()
 
     def set_selection_mode(self, mode: str) -> None:
         self.selection_mode = mode
 
     def clear_selection(self) -> None:
-        if not self.selected_faces:
-            return
-        self.selected_faces.clear()
-        self._redraw_mesh(reset_camera=False)
-        self.facesSelected.emit([])
+        if self.selected_faces:
+            self.selected_faces.clear()
+            self._update_mesh_visuals()
+            self.facesSelected.emit([])
 
     def get_selected_faces(self) -> List[int]:
         return sorted(self.selected_faces)
 
-    def _on_camera_event(self, _event) -> None:
-        if self.vertices is None:
-            return
-        if self.is_rotating or self.is_panning or self.is_zooming:
-            return
+    def _on_camera_event(self) -> None:
         self._camera_debounce.start()
-
-    def _on_mouse_motion(self, event) -> None:
-        if self.vertices is None or event.inaxes != self.ax:
-            return
-        if self.is_rotating and self._nav_last is not None:
-            dx = float(event.x) - self._nav_last[0]
-            dy = float(event.y) - self._nav_last[1]
-            self._nav_last = (float(event.x), float(event.y))
-            self._orbit_camera_by_delta(dx, dy)
-            return
-        if self.is_panning and self._nav_last is not None:
-            dx = float(event.x) - self._nav_last[0]
-            dy = float(event.y) - self._nav_last[1]
-            self._nav_last = (float(event.x), float(event.y))
-            self._pan_camera_by_delta(dx, dy)
-            self.canvas.draw_idle()
-            return
-        if self.is_zooming and self._nav_last is not None:
-            dy = float(event.y) - self._nav_last[1]
-            self._nav_last = (float(event.x), float(event.y))
-            self._zoom_camera_by_delta(dy)
-            self.canvas.draw_idle()
-            return
-        # Avoid hover picking/raycast work while any navigation drag is active.
-        if self.is_rotating or self.is_panning or self.is_zooming:
-            return
-        buttons = getattr(event, "buttons", None)
-        if buttons not in (None, 0):
-            return
-        self._camera_debounce.start()
-
-    def _on_mouse_press(self, event) -> None:
-        if event.inaxes != self.ax:
-            return
-        if self.orbit_mode_enabled and event.button == 3:
-            self.is_rotating = True
-            self.is_panning = False
-            self._nav_last = (float(event.x), float(event.y))
-            self._drag_start = None
-            return
-        if self.pan_mode_enabled and event.button in (1, 2):
-            self.is_panning = True
-            self.is_rotating = False
-            self._nav_last = (float(event.x), float(event.y))
-            self._drag_start = None
-            return
-        if self.zoom_mode_enabled and event.button in (1, 2):
-            self.is_zooming = True
-            self.is_rotating = False
-            self.is_panning = False
-            self._nav_last = (float(event.x), float(event.y))
-            self._drag_start = None
-            return
-        self._drag_start = (float(event.x), float(event.y))
-
-    def _on_mouse_release(self, event) -> None:
-        if self.vertices is None or self.pick_faces is None or event.inaxes != self.ax:
-            return
-        if event.button == 3 and self.is_rotating:
-            self.is_rotating = False
-            self._nav_last = None
-            self._emit_camera_changed()
-            return
-        if event.button in (1, 2) and self.is_panning:
-            self.is_panning = False
-            self._nav_last = None
-            self._emit_camera_changed()
-            return
-        if event.button in (1, 2) and self.is_zooming:
-            self.is_zooming = False
-            self._nav_last = None
-            self._emit_camera_changed()
-            return
-        self._on_camera_event(event)
-        if event.button != 1:
-            return
-        if self.selection_mode == "off":
-            return
-        if self._drag_start is not None:
-            dx = float(event.x) - self._drag_start[0]
-            dy = float(event.y) - self._drag_start[1]
-            if (dx * dx + dy * dy) > 25.0:
-                return
-        hit = self._raycast_face(float(event.x), float(event.y))
-        if hit is None:
-            return
-        if self.selection_mode == "single":
-            self.selected_faces = {int(hit)}
-        elif self.selection_mode == "smart":
-            self.selected_faces = self.smart_select(int(hit), 30.0)
-        self._redraw_mesh(reset_camera=False)
-        self.facesSelected.emit(self.get_selected_faces())
 
     def _emit_camera_changed(self) -> None:
-        self.cameraChanged.emit(float(self.ax.elev), float(self.ax.azim))
+        center = self.opts["center"]
+        cam = self.cameraPosition()
+        vx = float(cam.x() - center.x())
+        vy = float(cam.y() - center.y())
+        vz = float(cam.z() - center.z())
+        elev = float(math.degrees(math.atan2(vz, max(math.hypot(vx, vy), 1e-12))))
+        azim = float(math.degrees(math.atan2(vy, vx)))
+        self.cameraChanged.emit(elev, azim)
 
-    def _redraw_mesh(self, reset_camera: bool = False) -> None:
-        if self.vertices is None or self.render_faces is None:
+    def _update_grid_extent(self) -> None:
+        if self.vertices is None:
+            span = 3500.0
+            cx = 0.0
+            cy = 0.0
+        else:
+            mins = self.vertices.min(axis=0)
+            maxs = self.vertices.max(axis=0)
+            span = max(float(np.max(maxs - mins)) * 8.0, 800.0)
+            cx = float((mins[0] + maxs[0]) * 0.5)
+            cy = float((mins[1] + maxs[1]) * 0.5)
+        aspect = max(1.0, float(self.width()) / max(1.0, float(self.height())))
+        self.grid_item.resetTransform()
+        self.grid_item.setSize(x=max(2000.0, min(200000.0, span * aspect * 2.0)), y=max(2000.0, min(200000.0, span * 2.0)), z=1.0)
+        step = max(10.0, round((span / 80.0) / 10.0) * 10.0)
+        self.grid_item.setSpacing(step, step, 1.0)
+        self.grid_item.setColor((85, 85, 85, 110))
+        self.grid_item.translate(cx, cy, 0.0)
+
+    def _build_default_face_colors(self) -> np.ndarray:
+        if self.vertices is None or self.render_faces is None or len(self.render_faces) == 0:
+            return np.empty((0, 4), dtype=np.float32)
+        c = self.vertices[self.render_faces].mean(axis=1)
+        t = c[:, 2]
+        t = (t - t.min()) / max(float(t.max() - t.min()), 1e-9)
+        low = np.array([0.20, 0.24, 0.55], dtype=np.float32)
+        high = np.array([0.98, 0.90, 0.12], dtype=np.float32)
+        rgb = low[None, :] * (1.0 - t[:, None]) + high[None, :] * t[:, None]
+        alpha = np.full((len(rgb), 1), 0.96, dtype=np.float32)
+        return np.concatenate((rgb.astype(np.float32), alpha), axis=1)
+
+    def _build_pick_to_render_map(self) -> None:
+        if self.pick_faces is None or self.render_faces is None:
+            self._pick_to_render = None
             return
-        old_view = (float(self.ax.elev), float(self.ax.azim))
-        old_roll = float(getattr(self.ax, "roll", 0.0))
-        self.ax.clear()
-        self.ax.set_facecolor("#252525")
-        self.ax.set_proj_type("ortho")
-        self.ax.set_axis_off()
-        self.overlay.hide()
+        if len(self.pick_faces) == len(self.render_faces) and np.array_equal(self.pick_faces, self.render_faces):
+            self._pick_to_render = np.arange(len(self.pick_faces), dtype=np.int64)
+            return
+        render_map = {tuple(sorted(map(int, f))): i for i, f in enumerate(self.render_faces)}
+        self._pick_to_render = np.array([render_map.get(tuple(sorted(map(int, f))), -1) for f in self.pick_faces], dtype=np.int64)
 
-        self.ax.plot_trisurf(
-            self.vertices[:, 0],
-            self.vertices[:, 1],
-            self.vertices[:, 2],
-            triangles=self.render_faces,
-            cmap="viridis",
-            linewidth=0.05,
-            edgecolor="none",
-            antialiased=True,
-            shade=True,
-            alpha=0.95,
-        )
+    def _prepare_pick_raycast_cache(self) -> None:
+        if self.vertices is None or self.pick_faces is None or len(self.pick_faces) == 0:
+            self._pick_tri_a = None
+            self._pick_e1 = None
+            self._pick_e2 = None
+            return
+        tri = self.vertices[self.pick_faces]
+        self._pick_tri_a = tri[:, 0, :]
+        self._pick_e1 = tri[:, 1, :] - tri[:, 0, :]
+        self._pick_e2 = tri[:, 2, :] - tri[:, 0, :]
 
+    def _update_mesh_visuals(self) -> None:
+        if self.vertices32 is None or self.render_faces32 is None:
+            return
+        colors = self._base_render_face_colors.copy() if self._base_render_face_colors is not None else self._build_default_face_colors()
+        if self._pick_to_render is not None and self.selected_faces:
+            idx = np.asarray(sorted(self.selected_faces), dtype=np.int64)
+            idx = idx[(idx >= 0) & (idx < len(self._pick_to_render))]
+            ridx = self._pick_to_render[idx]
+            ridx = ridx[ridx >= 0]
+            if len(ridx):
+                colors[ridx] = np.array([1.0, 0.42, 0.05, 1.0], dtype=np.float32)
+        self.mesh_item.setMeshData(vertexes=self.vertices32, faces=self.render_faces32, faceColors=colors, smooth=False, drawEdges=False, shader="shaded")
         if self.selected_faces and self.pick_faces is not None:
             idx = np.asarray(sorted(self.selected_faces), dtype=np.int64)
-            sel_tris = self.vertices[self.pick_faces[idx]]
-            col = Poly3DCollection(
-                sel_tris,
-                facecolors=(1.0, 0.36, 0.0, 0.45),
-                edgecolors=(1.0, 0.68, 0.3, 0.8),
-                linewidths=0.15,
-            )
-            self.ax.add_collection3d(col)
-
-        self._set_equal_axes(self.vertices)
-        if reset_camera:
-            self._camera_position = None
-            self._camera_up = None
-            self._set_camera_view(elev=24.0, azim=-58.0, roll=0.0)
+            idx = idx[(idx >= 0) & (idx < len(self.pick_faces))]
+            if len(idx):
+                sel_faces = np.ascontiguousarray(self.pick_faces[idx].astype(np.int32, copy=False))
+                sel_colors = np.tile(np.array([1.0, 0.45, 0.0, 0.35], dtype=np.float32), (len(sel_faces), 1))
+                self.selection_item.setMeshData(vertexes=self.vertices32, faces=sel_faces, faceColors=sel_colors, smooth=False, drawEdges=False, shader="shaded")
+                self.selection_item.setVisible(True)
+            else:
+                self.selection_item.setVisible(False)
         else:
-            self._set_camera_view(elev=old_view[0], azim=old_view[1], roll=old_roll)
+            self.selection_item.setVisible(False)
+        self.update()
 
-    def _set_equal_axes(self, vertices: np.ndarray) -> None:
-        max_range = np.array(
-            [
-                vertices[:, 0].max() - vertices[:, 0].min(),
-                vertices[:, 1].max() - vertices[:, 1].min(),
-                vertices[:, 2].max() - vertices[:, 2].min(),
-            ]
-        ).max() / 2.0
-        mid_x = (vertices[:, 0].max() + vertices[:, 0].min()) * 0.5
-        mid_y = (vertices[:, 1].max() + vertices[:, 1].min()) * 0.5
-        mid_z = (vertices[:, 2].max() + vertices[:, 2].min()) * 0.5
-        self.ax.set_xlim(mid_x - max_range, mid_x + max_range)
-        self.ax.set_ylim(mid_y - max_range, mid_y + max_range)
-        self.ax.set_zlim(mid_z - max_range, mid_z + max_range)
-
-    def _raycast_face(self, screen_x: float, screen_y: float) -> int | None:
-        if self.vertices is None or self.pick_faces is None or len(self.pick_faces) == 0:
+    def _screen_ray(self, sx: float, sy: float) -> Tuple[np.ndarray, np.ndarray] | None:
+        w = max(1, int(self.width()))
+        h = max(1, int(self.height()))
+        proj = self.projectionMatrix((0, 0, w, h), self.getViewport())
+        inv_mvp, ok = (proj * self.viewMatrix()).inverted()
+        if not ok:
             return None
-
-        x2, y2, z2 = proj3d.proj_transform(
-            self.vertices[:, 0], self.vertices[:, 1], self.vertices[:, 2], self.ax.get_proj()
-        )
-        disp = self.ax.transData.transform(np.column_stack([x2, y2]))
-
-        tri = disp[self.pick_faces]  # (F,3,2)
-        bbox_min = tri.min(axis=1)
-        bbox_max = tri.max(axis=1)
-        candidates = np.where(
-            (screen_x >= bbox_min[:, 0]) & (screen_x <= bbox_max[:, 0]) & (screen_y >= bbox_min[:, 1]) & (screen_y <= bbox_max[:, 1])
-        )[0]
-        if len(candidates) == 0:
+        x_ndc = (2.0 * sx / float(w)) - 1.0
+        y_ndc = 1.0 - (2.0 * sy / float(h))
+        near_h = inv_mvp.map(QVector4D(float(x_ndc), float(y_ndc), -1.0, 1.0))
+        far_h = inv_mvp.map(QVector4D(float(x_ndc), float(y_ndc), 1.0, 1.0))
+        if abs(float(near_h.w())) < 1e-12 or abs(float(far_h.w())) < 1e-12:
             return None
+        near = np.array([near_h.x() / near_h.w(), near_h.y() / near_h.w(), near_h.z() / near_h.w()], dtype=np.float64)
+        far = np.array([far_h.x() / far_h.w(), far_h.y() / far_h.w(), far_h.z() / far_h.w()], dtype=np.float64)
+        d = far - near
+        n = float(np.linalg.norm(d))
+        return None if n < 1e-12 else (near, d / n)
 
-        p = np.array([screen_x, screen_y], dtype=np.float64)
-        t = tri[candidates]
-        a = t[:, 0, :]
-        b = t[:, 1, :]
-        c = t[:, 2, :]
-        v0 = b - a
-        v1 = c - a
-        v2 = p - a
-        den = v0[:, 0] * v1[:, 1] - v1[:, 0] * v0[:, 1]
-        den = np.where(np.abs(den) < 1e-12, 1e-12, den)
-        u = (v2[:, 0] * v1[:, 1] - v1[:, 0] * v2[:, 1]) / den
-        v = (v0[:, 0] * v2[:, 1] - v2[:, 0] * v0[:, 1]) / den
-        inside = (u >= -1e-6) & (v >= -1e-6) & ((u + v) <= 1.0 + 1e-6)
-        hits = candidates[inside]
-        if len(hits) == 0:
+    def _raycast_face(self, sx: float, sy: float) -> int | None:
+        if self._pick_tri_a is None or self._pick_e1 is None or self._pick_e2 is None or self.pick_faces is None:
             return None
-
-        ztri = z2[self.pick_faces[hits]]
-        depths = ztri.mean(axis=1)
-        return int(hits[int(np.argmax(depths))])
+        ray = self._screen_ray(sx, sy)
+        if ray is None:
+            return None
+        origin, direction = ray
+        a = self._pick_tri_a
+        e1 = self._pick_e1
+        e2 = self._pick_e2
+        eps = 1e-9
+        pvec = np.cross(np.broadcast_to(direction, a.shape), e2)
+        det = np.einsum("ij,ij->i", e1, pvec)
+        valid = np.abs(det) > eps
+        if not np.any(valid):
+            return None
+        inv_det = np.zeros_like(det)
+        inv_det[valid] = 1.0 / det[valid]
+        tvec = origin - a
+        u = np.einsum("ij,ij->i", tvec, pvec) * inv_det
+        valid &= (u >= 0.0) & (u <= 1.0)
+        if not np.any(valid):
+            return None
+        qvec = np.cross(tvec, e1)
+        v = np.einsum("ij,j->i", qvec, direction) * inv_det
+        valid &= (v >= 0.0) & ((u + v) <= 1.0)
+        if not np.any(valid):
+            return None
+        t = np.einsum("ij,ij->i", e2, qvec) * inv_det
+        valid &= t > eps
+        if not np.any(valid):
+            return None
+        cand = np.where(valid)[0]
+        return int(cand[int(np.argmin(t[cand]))])
 
     def _ensure_selection_topology(self) -> None:
         if self.vertices is None or self.pick_faces is None:
             return
-        if self._face_normals is not None and self._face_adjacency is not None and self._pick_cache_token == (
-            len(self.vertices),
-            len(self.pick_faces),
-        ):
+        if self._face_normals is not None and self._face_adjacency is not None and self._pick_cache_token == (len(self.vertices), len(self.pick_faces)):
             return
-
-        faces = self.pick_faces
-        tri = self.vertices[faces]
+        tri = self.vertices[self.pick_faces]
         normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
         lens = np.linalg.norm(normals, axis=1)
         lens = np.where(lens < 1e-12, 1e-12, lens)
-        normals = normals / lens[:, None]
-
+        self._face_normals = normals / lens[:, None]
         edge_to_faces: Dict[Tuple[int, int], List[int]] = {}
-        for fi, (a, b, c) in enumerate(faces):
-            edges = [(int(a), int(b)), (int(b), int(c)), (int(c), int(a))]
-            for u, v in edges:
+        for fi, (a, b, c) in enumerate(self.pick_faces):
+            for u, v in ((int(a), int(b)), (int(b), int(c)), (int(c), int(a))):
                 e = (u, v) if u < v else (v, u)
                 edge_to_faces.setdefault(e, []).append(fi)
-
-        adjacency = [set() for _ in range(len(faces))]
-        for flist in edge_to_faces.values():
-            if len(flist) < 2:
+        adj = [set() for _ in range(len(self.pick_faces))]
+        for fs in edge_to_faces.values():
+            if len(fs) < 2:
                 continue
-            for i in range(len(flist)):
-                for j in range(i + 1, len(flist)):
-                    a = flist[i]
-                    b = flist[j]
-                    adjacency[a].add(b)
-                    adjacency[b].add(a)
-
-        self._face_normals = normals
-        self._face_adjacency = [sorted(list(n)) for n in adjacency]
+            for i in range(len(fs)):
+                for j in range(i + 1, len(fs)):
+                    adj[fs[i]].add(fs[j])
+                    adj[fs[j]].add(fs[i])
+        self._face_adjacency = [sorted(list(a)) for a in adj]
         self._pick_cache_token = (len(self.vertices), len(self.pick_faces))
 
     def smart_select(self, seed_face: int, angle_limit_deg: float = 30.0) -> Set[int]:
@@ -607,9 +614,8 @@ class ThreeDViewportWidget(QWidget):
             return {seed_face}
         cos_thresh = math.cos(math.radians(angle_limit_deg))
         selected: Set[int] = set()
-        visited: Set[int] = set()
+        visited: Set[int] = {int(seed_face)}
         q = deque([int(seed_face)])
-        visited.add(int(seed_face))
         while q:
             face = q.popleft()
             selected.add(face)
@@ -618,17 +624,6 @@ class ThreeDViewportWidget(QWidget):
                 if nb in visited:
                     continue
                 visited.add(nb)
-                n1 = self._face_normals[nb]
-                if float(np.dot(n0, n1)) >= cos_thresh:
+                if float(np.dot(n0, self._face_normals[nb])) >= cos_thresh:
                     q.append(nb)
         return selected
-
-    def contextMenuEvent(self, event) -> None:  # noqa: N802
-        if self.vertices is None or self.is_rotating or self.is_panning or self.is_zooming:
-            return
-        menu = QMenu(self)
-        flatten_action = menu.addAction("Flatten Selected")
-        chosen = menu.exec(event.globalPos())
-        if chosen == flatten_action:
-            self.flattenRequested.emit()
-

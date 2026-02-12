@@ -11,3 +11,5 @@ shapely>=2.0
 PySide6>=6.7
 qt-material>=2.14
 gmsh>=4.13
+pyqtgraph>=0.14.0
+PyOpenGL>=3.1.7

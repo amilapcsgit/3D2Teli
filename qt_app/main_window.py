@@ -9,7 +9,7 @@ from typing import Dict, Iterable, List, Tuple
 import ezdxf
 import numpy as np
 import trimesh
-from PySide6.QtCore import QSettings, Qt, QTimer, QPointF, QRectF
+from PySide6.QtCore import QSettings, Qt, QTimer, QPointF, QRectF, QSize
 from PySide6.QtGui import QAction, QColor, QContextMenuEvent, QPainter, QPainterPath, QPen, QBrush, QPolygonF
 from PySide6.QtWidgets import (
     QApplication,
@@ -35,7 +35,6 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStackedWidget,
-    QTextEdit,
     QToolBar,
     QToolButton,
     QVBoxLayout,
@@ -462,11 +461,15 @@ class NestingRollWidget(QWidget):
 class CompassGizmoWidget(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setFixedSize(132, 132)
+        self.setMinimumSize(100, 100)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet("background-color: rgba(16, 18, 22, 175); border: 1px solid #3b4350; border-radius: 8px;")
         self._hotspots: List[Tuple[str, QRectF]] = []
         self._on_view_selected = None
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        return QSize(132, 132)
 
     def set_view_callback(self, callback) -> None:
         self._on_view_selected = callback
@@ -572,14 +575,13 @@ class ThreeDViewportWidget(QWidget):
             "QLabel { color:#8fa0b7; font-size:24px; font-weight:600; background:transparent; }"
         )
         self.overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        layout.addWidget(self.overlay, 0, Qt.AlignmentFlag.AlignCenter)
 
         self.dim_label = QLabel("", self)
         self.dim_label.setStyleSheet(
             "QLabel { color:#d5deec; background-color:rgba(20,22,28,170); border:1px solid #3a4250; padding:4px 8px; }"
         )
         self.dim_label.move(14, 14)
-        self.dim_label.resize(360, 28)
+        self.dim_label.setMinimumSize(220, 28)
         self.dim_label.show()
         self.compass = CompassGizmoWidget(self)
         self.compass.set_view_callback(self._set_view_from_gizmo)
@@ -702,7 +704,7 @@ class TentMakerMainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Tent-Maker Pro (Qt)")
-        self.resize(1540, 920)
+        self.setMinimumSize(1100, 700)
         self._settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
         self._seam_debounce = QTimer(self)
         self._seam_debounce.setSingleShot(True)
@@ -717,6 +719,7 @@ class TentMakerMainWindow(QMainWindow):
         self.last_output_dxf: str | None = None
         self.nesting_layout: Dict | None = None
         self.nesting_output_dir: str | None = None
+        self._log_history: List[str] = []
 
         self.breadcrumb = BreadcrumbBar(self)
         self.breadcrumb.bind_step_handlers(self.on_breadcrumb_step)
@@ -729,15 +732,19 @@ class TentMakerMainWindow(QMainWindow):
 
         self.flatten_workspace = QWidget(self)
         split_layout = QVBoxLayout(self.flatten_workspace)
-        split_layout.setContentsMargins(8, 8, 8, 8)
+        split_layout.setContentsMargins(0, 0, 0, 0)
         split_layout.setSpacing(0)
         self.viewport_splitter = QSplitter(Qt.Orientation.Horizontal, self.flatten_workspace)
         self.viewport_splitter.setChildrenCollapsible(False)
         self.viewport_splitter.setHandleWidth(6)
+        self.viewport_splitter.setContentsMargins(0, 0, 0, 0)
+        self.viewport_splitter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.viewport_splitter.setStyleSheet("QSplitter::handle { background-color: #353535; }")
         self.viewport3d = ThreeDViewportWidget(self.viewport_splitter)
+        self.viewport3d.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.viewport3d.set_callbacks(self.load_model_file, self.flatten_all)
         self.preview2d = Flatten2DPreviewWidget(self.viewport_splitter)
+        self.preview2d.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.viewport_splitter.addWidget(self.viewport3d)
         self.viewport_splitter.addWidget(self.preview2d)
         self.viewport_splitter.setStretchFactor(0, 10)
@@ -776,20 +783,18 @@ class TentMakerMainWindow(QMainWindow):
         c_layout = QVBoxLayout(central)
         c_layout.setContentsMargins(0, 0, 0, 0)
         c_layout.setSpacing(0)
-        c_layout.addWidget(self.breadcrumb)
+        c_layout.addWidget(self.breadcrumb, 0)
         workspace = QWidget(central)
         workspace_layout = QHBoxLayout(workspace)
-        workspace_layout.setContentsMargins(8, 8, 8, 8)
-        workspace_layout.setSpacing(8)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
+        workspace_layout.setSpacing(0)
         workspace_layout.addWidget(self._pages, 1)
         self.guided_sidebar = self._build_guided_sidebar()
         self.guided_sidebar.setFixedWidth(380)
         workspace_layout.addWidget(self.guided_sidebar)
         c_layout.addWidget(workspace, 1)
-        c_layout.setStretchFactor(workspace, 10)
-        self.message_log = self._build_messages_dock()
-        self.message_log.setMaximumHeight(100)
-        c_layout.addWidget(self.message_log)
+        c_layout.setStretch(0, 0)
+        c_layout.setStretch(1, 10)
         self.setCentralWidget(central)
 
         self._build_top_toolbar()
@@ -946,11 +951,6 @@ class TentMakerMainWindow(QMainWindow):
         self.nudge_step_spin.valueChanged.connect(self._apply_nesting_edit_options)
         return host
 
-    def _build_messages_dock(self) -> QTextEdit:
-        log = QTextEdit(self)
-        log.setReadOnly(True)
-        return log
-
     def _add_view_actions(self) -> None:
         view_menu = self.menuBar().addMenu("View")
         reset_layout = QAction("Reset Layout", self)
@@ -959,7 +959,6 @@ class TentMakerMainWindow(QMainWindow):
 
     def _reset_layout(self) -> None:
         self.guided_sidebar.show()
-        self.message_log.show()
         self.log("Layout reset.")
 
     def on_breadcrumb_step(self, step: int) -> None:
@@ -1231,9 +1230,8 @@ class TentMakerMainWindow(QMainWindow):
         )
 
     def log(self, message: str) -> None:
-        self.message_log.append(message)
-        sb = self.message_log.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        self._log_history.append(message)
+        self.statusBar().showMessage(message, 5000)
 
     def _update_mesh_quality(self) -> None:
         if self.loaded_mesh is None:

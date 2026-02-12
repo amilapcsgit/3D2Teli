@@ -30,7 +30,6 @@ from PySide6.QtWidgets import (
     QSlider,
     QSplitter,
     QTabWidget,
-    QTextEdit,
     QToolBar,
     QToolButton,
     QVBoxLayout,
@@ -361,7 +360,7 @@ class RibbonMainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Tent-Maker Pro (Qt)")
-        self.resize(1600, 940)
+        self.setMinimumSize(1100, 700)
         self._settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
         self._seam_debounce = QTimer(self)
         self._seam_debounce.setSingleShot(True)
@@ -386,6 +385,7 @@ class RibbonMainWindow(QMainWindow):
         self._active_success_cb = None
         self._active_after_message = ""
         self._preview2d_visible = False
+        self._log_history: List[str] = []
 
         self._build_ui()
         self._restore_layout()
@@ -404,11 +404,14 @@ class RibbonMainWindow(QMainWindow):
         self.viewport_splitter = QSplitter(Qt.Orientation.Horizontal, central)
         self.viewport_splitter.setChildrenCollapsible(False)
         self.viewport_splitter.setHandleWidth(6)
+        self.viewport_splitter.setContentsMargins(0, 0, 0, 0)
+        self.viewport_splitter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.viewport_splitter.setStyleSheet("QSplitter::handle { background-color: #353535; }")
 
         self.viewport = ThreeDViewportWidget(self.viewport_splitter)
-        self.viewport.setStyleSheet("background-color: #252525; border: none;")
+        self.viewport.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.preview2d = Flatten2DPreviewWidget(self.viewport_splitter)
+        self.preview2d.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.preview2d.setStyleSheet("background-color: #252525;")
         self.viewport_splitter.addWidget(self.viewport)
         self.viewport_splitter.addWidget(self.preview2d)
@@ -430,15 +433,10 @@ class RibbonMainWindow(QMainWindow):
 
         self.ribbon = self._build_ribbon()
         self.ribbon.setFixedHeight(140)
-        root.addWidget(self.ribbon)
+        root.addWidget(self.ribbon, 0)
         root.addWidget(self.viewport_splitter, 1)
-        root.setStretchFactor(self.viewport_splitter, 10)
-
-        self.message_log = QTextEdit(central)
-        self.message_log.setReadOnly(True)
-        self.message_log.setMaximumHeight(100)
-        self.message_log.setStyleSheet("background-color: #252525; border: none;")
-        root.addWidget(self.message_log)
+        root.setStretch(0, 0)
+        root.setStretch(1, 10)
 
         self.setCentralWidget(central)
         self._apply_selection_mode()
@@ -994,9 +992,8 @@ class RibbonMainWindow(QMainWindow):
         self.status_meta_label.setText(f"Units: {unit} | LxWxH: {lx:.1f} x {ly:.1f} x {lz:.1f} mm")
 
     def log(self, message: str) -> None:
-        self.message_log.append(message)
-        sb = self.message_log.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        self._log_history.append(message)
+        self.statusBar().showMessage(message, 5000)
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self._worker_thread is not None and self._worker_thread.isRunning():

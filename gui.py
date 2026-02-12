@@ -443,7 +443,7 @@ class FlattenApp(ctk.CTk):
             self.preview_component(idx)
 
     def browse_input(self):
-        filename = filedialog.askopenfilename(filetypes=[("3D files", "*.stl *.obj *.3ds"), ("All files", "*.*")])
+        filename = filedialog.askopenfilename(filetypes=[("3D files", "*.stl *.obj *.3ds *.stp *.step"), ("All files", "*.*")])
         if filename:
             picked_unit = self._ask_input_unit()
             if not picked_unit:

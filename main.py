@@ -15,7 +15,7 @@ def run_default_app() -> int:
         return 0
 
     try:
-        from qt_app.main_window import run_qt_app
+        from qt_app.main import run_qt_app
 
         return int(run_qt_app())
     except Exception as exc:

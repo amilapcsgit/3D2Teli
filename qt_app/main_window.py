@@ -15,7 +15,6 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
-    QDockWidget,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -27,7 +26,6 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QListWidget,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -35,6 +33,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSpinBox,
+    QSplitter,
     QStackedWidget,
     QTextEdit,
     QToolBar,
@@ -50,6 +49,7 @@ from shapely.geometry import MultiPolygon, Polygon
 from flatten_surface.flatten_surface import flatten_mesh
 from flatten_surface.import_export import get_unit_scale
 from nesting import build_nesting_layout, export_nesting_layout, Placement
+from qt_app.mesh_io import load_mesh_file
 
 
 class BreadcrumbBar(QWidget):
@@ -566,7 +566,7 @@ class ThreeDViewportWidget(QWidget):
         self.ax.set_axis_off()
         layout.addWidget(self.canvas, 1)
 
-        self.overlay = QLabel("Drop 3D Model Here\n(STL / OBJ)", self)
+        self.overlay = QLabel("Drop 3D Model Here\n(STL / OBJ / STEP)", self)
         self.overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.overlay.setStyleSheet(
             "QLabel { color:#8fa0b7; font-size:24px; font-weight:600; background:transparent; }"
@@ -602,7 +602,7 @@ class ThreeDViewportWidget(QWidget):
             urls = event.mimeData().urls()
             if urls:
                 p = urls[0].toLocalFile().lower()
-                if p.endswith(".stl") or p.endswith(".obj"):
+                if p.endswith(".stl") or p.endswith(".obj") or p.endswith(".stp") or p.endswith(".step"):
                     event.acceptProposedAction()
                     return
         event.ignore()
@@ -728,13 +728,23 @@ class TentMakerMainWindow(QMainWindow):
         self._pages.addWidget(self.page_import)
 
         self.flatten_workspace = QWidget(self)
-        split_layout = QHBoxLayout(self.flatten_workspace)
+        split_layout = QVBoxLayout(self.flatten_workspace)
         split_layout.setContentsMargins(8, 8, 8, 8)
-        self.viewport3d = ThreeDViewportWidget(self.flatten_workspace)
+        split_layout.setSpacing(0)
+        self.viewport_splitter = QSplitter(Qt.Orientation.Horizontal, self.flatten_workspace)
+        self.viewport_splitter.setChildrenCollapsible(False)
+        self.viewport_splitter.setHandleWidth(6)
+        self.viewport_splitter.setStyleSheet("QSplitter::handle { background-color: #353535; }")
+        self.viewport3d = ThreeDViewportWidget(self.viewport_splitter)
         self.viewport3d.set_callbacks(self.load_model_file, self.flatten_all)
-        self.preview2d = Flatten2DPreviewWidget(self.flatten_workspace)
-        split_layout.addWidget(self.viewport3d, 3)
-        split_layout.addWidget(self.preview2d, 2)
+        self.preview2d = Flatten2DPreviewWidget(self.viewport_splitter)
+        self.viewport_splitter.addWidget(self.viewport3d)
+        self.viewport_splitter.addWidget(self.preview2d)
+        self.viewport_splitter.setStretchFactor(0, 10)
+        self.viewport_splitter.setStretchFactor(1, 4)
+        split_layout.addWidget(self.viewport_splitter, 1)
+        self._preview2d_visible = False
+        self._set_2d_preview_visible(False)
         self._pages.addWidget(self.flatten_workspace)
 
         self.page_nest = QWidget(self)
@@ -767,13 +777,21 @@ class TentMakerMainWindow(QMainWindow):
         c_layout.setContentsMargins(0, 0, 0, 0)
         c_layout.setSpacing(0)
         c_layout.addWidget(self.breadcrumb)
-        c_layout.addWidget(self._pages, 1)
+        workspace = QWidget(central)
+        workspace_layout = QHBoxLayout(workspace)
+        workspace_layout.setContentsMargins(8, 8, 8, 8)
+        workspace_layout.setSpacing(8)
+        workspace_layout.addWidget(self._pages, 1)
+        self.guided_sidebar = self._build_guided_sidebar()
+        self.guided_sidebar.setFixedWidth(380)
+        workspace_layout.addWidget(self.guided_sidebar)
+        c_layout.addWidget(workspace, 1)
+        c_layout.setStretchFactor(workspace, 10)
+        self.message_log = self._build_messages_dock()
+        self.message_log.setMaximumHeight(100)
+        c_layout.addWidget(self.message_log)
         self.setCentralWidget(central)
 
-        self.flatten_dock = self._build_guided_sidebar()
-        self.messages_dock = self._build_messages_dock()
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.flatten_dock)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.messages_dock)
         self._build_top_toolbar()
         self._add_view_actions()
         self._apply_nesting_edit_options()
@@ -798,6 +816,10 @@ class TentMakerMainWindow(QMainWindow):
         flatten_action.triggered.connect(self.flatten_all)
         tb.addAction(flatten_action)
 
+        self.toggle_preview_action = QAction("Show/Hide 2D Preview", self)
+        self.toggle_preview_action.triggered.connect(self.toggle_2d_preview)
+        tb.addAction(self.toggle_preview_action)
+
         spacer2 = QWidget(self)
         spacer2.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         tb.addWidget(spacer2)
@@ -806,11 +828,22 @@ class TentMakerMainWindow(QMainWindow):
         export_action.triggered.connect(self.export_dxf)
         tb.addAction(export_action)
 
-    def _build_guided_sidebar(self) -> QDockWidget:
-        dock = QDockWidget("Guided Workflow", self)
-        dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
+    def _set_2d_preview_visible(self, visible: bool) -> None:
+        self._preview2d_visible = bool(visible)
+        if self._preview2d_visible:
+            self.preview2d.show()
+            total = max(self.viewport_splitter.width(), 1200)
+            left = int(total * 0.68)
+            self.viewport_splitter.setSizes([left, total - left])
+        else:
+            self.preview2d.hide()
+            self.viewport_splitter.setSizes([1, 0])
 
-        host = QWidget(dock)
+    def toggle_2d_preview(self) -> None:
+        self._set_2d_preview_visible(not self._preview2d_visible)
+
+    def _build_guided_sidebar(self) -> QWidget:
+        host = QWidget(self)
         v = QVBoxLayout(host)
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(8)
@@ -911,36 +944,22 @@ class TentMakerMainWindow(QMainWindow):
         self.snap_grid_spin.valueChanged.connect(self._apply_nesting_edit_options)
         self.show_grid_check.toggled.connect(self._apply_nesting_edit_options)
         self.nudge_step_spin.valueChanged.connect(self._apply_nesting_edit_options)
-        dock.setWidget(host)
-        return dock
+        return host
 
-    def _build_messages_dock(self) -> QDockWidget:
-        dock = QDockWidget("Messages", self)
-        host = QWidget(dock)
-        v = QVBoxLayout(host)
-        self.message_list = QListWidget(host)
-        self.message_list.setAlternatingRowColors(True)
-        self.message_details = QTextEdit(host)
-        self.message_details.setReadOnly(True)
-        self.message_list.currentTextChanged.connect(self.message_details.setPlainText)
-        v.addWidget(self.message_list)
-        v.addWidget(self.message_details)
-        dock.setWidget(host)
-        return dock
+    def _build_messages_dock(self) -> QTextEdit:
+        log = QTextEdit(self)
+        log.setReadOnly(True)
+        return log
 
     def _add_view_actions(self) -> None:
         view_menu = self.menuBar().addMenu("View")
-        view_menu.addAction(self.flatten_dock.toggleViewAction())
-        view_menu.addAction(self.messages_dock.toggleViewAction())
         reset_layout = QAction("Reset Layout", self)
         reset_layout.triggered.connect(self._reset_layout)
         view_menu.addAction(reset_layout)
 
     def _reset_layout(self) -> None:
-        self.flatten_dock.setFloating(False)
-        self.messages_dock.setFloating(False)
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.flatten_dock)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.messages_dock)
+        self.guided_sidebar.show()
+        self.message_log.show()
         self.log("Layout reset.")
 
     def on_breadcrumb_step(self, step: int) -> None:
@@ -949,14 +968,14 @@ class TentMakerMainWindow(QMainWindow):
         self.log(f"Workflow step selected: {step + 1}")
 
     def import_3d_dialog(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Import 3D Model", "", "3D files (*.stl *.obj)")
+        path, _ = QFileDialog.getOpenFileName(self, "Import 3D Model", "", "3D files (*.stl *.obj *.stp *.step)")
         if path:
             self.load_model_file(path)
 
     def load_model_file(self, path: str) -> None:
         try:
             t0 = time.perf_counter()
-            mesh = trimesh.load(path)
+            mesh = load_mesh_file(path)
             if isinstance(mesh, trimesh.Scene):
                 mesh = mesh.dump(concatenate=True)
             vertices = np.asarray(mesh.vertices, dtype=np.float64)
@@ -1212,8 +1231,9 @@ class TentMakerMainWindow(QMainWindow):
         )
 
     def log(self, message: str) -> None:
-        self.message_list.addItem(message)
-        self.message_list.setCurrentRow(self.message_list.count() - 1)
+        self.message_log.append(message)
+        sb = self.message_log.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     def _update_mesh_quality(self) -> None:
         if self.loaded_mesh is None:
@@ -1243,41 +1263,86 @@ class TentMakerMainWindow(QMainWindow):
 
     def _save_layout(self) -> None:
         self._settings.setValue("geometry", self.saveGeometry())
-        self._settings.setValue("state", self.saveState())
+        self._settings.remove("state")
         self._settings.setValue("last_export_path", self.last_export_path)
 
     def _restore_layout(self) -> None:
         geometry = self._settings.value("geometry")
-        state = self._settings.value("state")
         if geometry is not None:
             self.restoreGeometry(geometry)
-        if state is not None:
-            self.restoreState(state)
 
 
 def run_qt_app() -> int:
+    from PySide6.QtGui import QFont, QSurfaceFormat
+
+    fmt = QSurfaceFormat()
+    fmt.setRenderableType(QSurfaceFormat.RenderableType.OpenGL)
+    fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
+    fmt.setVersion(4, 1)
+    QSurfaceFormat.setDefaultFormat(fmt)
+
     app = QApplication.instance() or QApplication(sys.argv)
-    try:
-        import qt_material
 
-        qt_material.apply_stylesheet(app, theme="dark_teal.xml")
-    except Exception:
-        app.setStyleSheet(
-            """
-            QMainWindow, QWidget { background-color: #20242b; color: #d8e0ee; }
-            QGroupBox { border: 1px solid #364050; margin-top: 8px; padding-top: 8px; font-weight: 600; }
-            QToolBar { background: #1d2128; border-bottom: 1px solid #364050; }
-            QLineEdit, QComboBox, QSpinBox, QTextEdit, QListWidget {
-                background: #2a2f38; border: 1px solid #445066; border-radius: 4px; padding: 4px;
-            }
-            QPushButton {
-                background: #1f6fb2; border: 1px solid #2b7fc4; border-radius: 4px; padding: 6px 10px;
-            }
-            QPushButton:hover { background: #2580cb; }
-            QPushButton:disabled { background: #3a4250; color: #95a0b3; }
-            """
-        )
+    app.setFont(QFont("Segoe UI", 10))
+    app.setStyleSheet(
+        """
+        QMainWindow { background-color: #252525; color: #e0e0e0; }
+        QWidget { background-color: #252525; color: #e0e0e0; }
+        QToolBar { background: #252525; border: 1px solid #3a3a3a; spacing: 8px; }
+        QStatusBar { background-color: #252525; color: #888; font-size: 11px; }
+        QStatusBar QLabel { color: #a7b2c2; background: transparent; }
 
-    win = TentMakerMainWindow()
+        QTabWidget::pane { border: 1px solid #333; top: -1px; background-color: #252525; }
+        QTabBar::tab {
+            background: #252525;
+            padding: 10px 20px;
+            border-top-left-radius: 4px;
+            border-top-right-radius: 4px;
+            margin-right: 2px;
+        }
+        QTabBar::tab:selected { background: #444; color: #00aaff; border-bottom: 2px solid #00aaff; }
+
+        QPushButton, QToolButton {
+            background-color: #252525;
+            border: 1px solid #555;
+            padding: 8px 15px;
+            border-radius: 4px;
+            min-width: 80px;
+        }
+        QPushButton:hover, QToolButton:hover { background-color: #252525; border: 1px solid #00aaff; }
+        QPushButton:disabled, QToolButton:disabled { background-color: #252525; color: #8f8f8f; border-color: #4a4a4a; }
+        QPushButton#FlattenButton, QToolButton#FlattenButton { background-color: #0066cc; font-weight: bold; font-size: 14px; }
+        QPushButton#FlattenButton:hover, QToolButton#FlattenButton:hover { background-color: #0078d7; }
+
+        QGroupBox {
+            font-weight: bold;
+            border: 1px solid #444;
+            margin-top: 10px;
+            padding-top: 15px;
+            border-radius: 4px;
+        }
+        QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 3px; color: #b9c6d7; }
+
+        QLineEdit, QComboBox, QSpinBox, QTextEdit, QListWidget {
+            background: #252525;
+            border: 1px solid #4b5665;
+            border-radius: 4px;
+            padding: 6px;
+        }
+        QProgressBar {
+            border: 1px solid #4c596d;
+            border-radius: 4px;
+            background: #252525;
+            color: #dce7f7;
+            text-align: center;
+            padding: 1px;
+        }
+        QProgressBar::chunk { background-color: #0078d7; border-radius: 3px; }
+        """
+    )
+
+    from qt_app.ribbon_window import create_window
+
+    win = create_window()
     win.show()
     return app.exec()
